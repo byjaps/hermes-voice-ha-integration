@@ -2,6 +2,15 @@
 
 All notable changes to the hermes-voice-ha-integration project.
 
+## [0.0.14] — 2026-09-14
+
+### Fixed
+- Made frontend static-route registration idempotent so reloading the config entry on Home Assistant 2026.9+ does not abort setup with aiohttp's duplicate GET route error.
+
+### Documentation
+- Corrected the Hermes plugin check and WebSocket test commands.
+- Synchronised release metadata across the Python package, HACS manifest, add-on config, and bundled Hermes plugins.
+
 ## [0.0.12] — 2026-06-26
 
 ### Fixed
