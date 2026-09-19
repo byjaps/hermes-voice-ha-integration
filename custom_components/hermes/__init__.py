@@ -353,11 +353,11 @@ class HermesBridge:
             raise ConnectionError("Hermes WebSocket not connected")
 
         try:
-            result = await asyncio.wait_for(future, timeout=30.0)
+            result = await asyncio.wait_for(future, timeout=45.0)
             return result
         except asyncio.TimeoutError:
             self._pending_queries.pop(conversation_id, None)
-            raise TimeoutError("Hermes did not respond within 30 seconds")
+            raise TimeoutError("Hermes did not respond within 45 seconds")
 
     async def async_shutdown(self) -> None:
         """Clean up connections."""
