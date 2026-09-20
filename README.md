@@ -380,12 +380,13 @@ After adding the integration, open **Settings → Devices &amp; services → Her
 
 The options flow has two pages.
 
-### Page 1 — Allow-listed entities &amp; SSL
+### Page 1 — Allow-listed entities, SSL &amp; local handling
 
 | Field | What to enter |
 |---|---|
 | **Entity IDs to monitor** | One entity per line or comma-separated (empty = all entities) |
 | **Verify SSL certificates** | Toggle off if your Hermes endpoint uses a self-signed cert |
+| **Local HA intent handling** | `off` (default), `answers`, or `commands` — see below |
 
 ### Page 2 — Voice pipeline
 
@@ -404,6 +405,23 @@ The options flow has two pages.
 | **Media player entity ID** | HA `media_player.*` entity used for TTS playback (e.g. `media_player.living_room_speaker`) |
 
 Values are persisted in the config entry options. After saving, Hermes reads them from `entry.options` on every restart. Screenshots of the live UI are welcome via PR.
+
+### Local HA intent handling (opt-in, off by default)
+
+Home Assistant ships a native conversation agent (`conversation.home_assistant`) that answers house questions and runs house commands locally, using HA's own sentence templates — no LLM, milliseconds instead of seconds. Hermes can hand a request to that agent before spending a full Hermes round-trip.
+
+| Mode | Behaviour |
+|---|---|
+| `off` (default) | Every request goes to Hermes. Nothing is answered or executed locally. |
+| `answers` | Hermes asks the native agent first; if HA recognises the sentence as an informational intent (`QUERY_ANSWER`: room temperature, which lights are on, is the window open…), that answer is spoken immediately. Commands are still sent to Hermes. |
+| `commands` | As `answers`, plus house commands (`ACTION_DONE`) that HA matches **on the intact transcript** are executed locally instead of going to Hermes. |
+
+Two safety properties are enforced regardless of the mode:
+
+- **The transcript sent to Hermes is never rewritten.** The only cleanup performed is dropping whisper.cpp non-speech annotations at the end of the sentence (`[música]`, `(risos)`, `[BLANK_AUDIO]` …) from a *copy* used for the local attempt. Legitimate text such as `send Sam a notification (urgent)` is untouched, and if the local attempt does not match, Hermes receives the original transcript byte for byte.
+- **Truncated sentences can never execute a command.** Cutting "ligar todas as luzes excepto a cozinha. Foi bonito." down to "ligar todas as luzes." changes the meaning, so a shortened candidate is only ever accepted for informational (`QUERY_ANSWER`) results. Commands require the transcript to be intact, and only run in `commands` mode.
+
+> **Security note (`commands` mode):** requests handled locally never reach Hermes, so they are not filtered by the Hermes Home Assistant plugin's allow-list/block-list and never appear in its audit log. Home Assistant's own boundaries still apply — intents can only reach entities you exposed to Assist. Turn `commands` on only if that trade-off is acceptable; leave it `off` if your allow-list is what keeps unsafe entities out of voice control.
 
 ---
 

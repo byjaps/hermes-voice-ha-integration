@@ -13,6 +13,7 @@ from .const import (
     DOMAIN,
     CONF_ENTITY_FILTER, DEFAULT_ENTITY_FILTER,
     CONF_VERIFY_SSL, DEFAULT_VERIFY_SSL,
+    CONF_LOCAL_INTENTS, DEFAULT_LOCAL_INTENTS, LOCAL_INTENTS_OPTIONS,
     CONF_TTS_ENGINE, DEFAULT_TTS_ENGINE, CONF_TTS_VOICE, DEFAULT_TTS_VOICE,
     CONF_STT_ENGINE, DEFAULT_STT_ENGINE, CONF_STT_MODEL, DEFAULT_STT_MODEL,
     CONF_WAKE_WORD_ENGINE, DEFAULT_WAKE_WORD_ENGINE,
@@ -36,6 +37,12 @@ def _parse_entity_filter(value) -> list[str]:
 def _parse_wake_word(value) -> list[str]:
     """Wake words can be a single string or comma-separated list."""
     return normalize_wake_word(value)
+
+
+def _parse_local_intents(value) -> str:
+    """Accept only a known local-intents mode; anything else means "off"."""
+    mode = str(value or "").strip().lower()
+    return mode if mode in LOCAL_INTENTS_OPTIONS else DEFAULT_LOCAL_INTENTS
 
 
 class HermesConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -98,6 +105,7 @@ def _default_options() -> dict:
         CONF_WAKE_WORD_ENGINE: DEFAULT_WAKE_WORD_ENGINE,
         CONF_WAKE_WORD: normalize_wake_word(DEFAULT_WAKE_WORD),
         CONF_MEDIA_PLAYER: DEFAULT_MEDIA_PLAYER,
+        CONF_LOCAL_INTENTS: DEFAULT_LOCAL_INTENTS,
     }
 
 
@@ -120,6 +128,9 @@ class HermesOptionsFlow(OptionsFlow):
                 CONF_VERIFY_SSL: bool(
                     user_input.get(CONF_VERIFY_SSL, DEFAULT_VERIFY_SSL)
                 ),
+                CONF_LOCAL_INTENTS: _parse_local_intents(
+                    user_input.get(CONF_LOCAL_INTENTS, DEFAULT_LOCAL_INTENTS)
+                ),
             }
             # Always drop through to voice step after init
             return await self.async_step_voice()
@@ -139,6 +150,10 @@ class HermesOptionsFlow(OptionsFlow):
                     CONF_VERIFY_SSL,
                     default=current.get(CONF_VERIFY_SSL, DEFAULT_VERIFY_SSL),
                 ): bool,
+                vol.Optional(
+                    CONF_LOCAL_INTENTS,
+                    default=current.get(CONF_LOCAL_INTENTS, DEFAULT_LOCAL_INTENTS),
+                ): vol.In(LOCAL_INTENTS_OPTIONS),
             }),
         )
 
@@ -179,6 +194,9 @@ class HermesOptionsFlow(OptionsFlow):
                 CONF_MEDIA_PLAYER: str(
                     user_input.get(CONF_MEDIA_PLAYER, current.get(CONF_MEDIA_PLAYER, DEFAULT_MEDIA_PLAYER))
                 ).strip(),
+                CONF_LOCAL_INTENTS: _parse_local_intents(
+                    current.get(CONF_LOCAL_INTENTS, DEFAULT_LOCAL_INTENTS)
+                ),
             }
             return self.async_create_entry(
                 title="",

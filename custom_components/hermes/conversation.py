@@ -29,95 +29,144 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN, MAX_QUERY_TEXT_LENGTH
+from .const import (
+    CONF_LOCAL_INTENTS,
+    DEFAULT_LOCAL_INTENTS,
+    DOMAIN,
+    LOCAL_INTENTS_COMMANDS,
+    LOCAL_INTENTS_OFF,
+    LOCAL_INTENTS_OPTIONS,
+    MAX_QUERY_TEXT_LENGTH,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
 AGENT_ID = f"{DOMAIN}_assist"
 AGENT_NAME = "Hermes"
 
-# Agente nativo do HA: resolve comandos de casa localmente, em milissegundos.
-# O identificador e o entity_id do agente (nao o slug "home_assistant").
+# Agente nativo do HA: resolve comandos/consultas de casa em milissegundos.
+# É o entity_id do agente (não o slug "home_assistant").
 LOCAL_AGENT_ID = "conversation.home_assistant"
 
-# --- Limpeza da transcricao -------------------------------------------------
-# O Whisper (whisper.cpp, modelo `medium`, pt-PT) cola lixo no fim da frase
-# quando o audio termina em silencio ou ruido: "[musica]", "E ai?", etc.
-# Esse lixo nao e inofensivo - faz falhar o matching de intents do proprio HA,
-# o que empurra o comando para o agente completo do Hermes (10-30 s) em vez de
-# ser resolvido localmente em milissegundos. Medido nesta instalacao:
-#   "ligar a luz pequena"          -> HA responde "Ligado"   (0,0 s)
-#   "ligar a luz pequena [musica]" -> erro do HA, cai no Hermes (~10 s)
-_TRASH_TAIL = re.compile(r"(?:\s*[\[(][^\])]*[\])])+\s*[.,;:!?]*\s*$")
-_TRASH_WORDS = re.compile(
-    r"(?:\s*[.,;:!?]*\s*\b(?:e\s+a[ií]|n[aã]o\s+[eé]\?|pronto|obrigad[oa]"
-    r"|[eé]\s+isso|est[aá]\s+bem|mais\s+alguma\s+coisa))\s*[.,;:!?]*\s*$",
-    re.IGNORECASE,
+# ---------------------------------------------------------------------------
+# Limpeza da transcrição
+# ---------------------------------------------------------------------------
+# O whisper.cpp cola anotações de NÃO-FALA no fim da frase quando o áudio
+# termina em silêncio ou ruído ("[música]", "(risos)", "[BLANK_AUDIO]"). Essas
+# anotações não são inofensivas: fazem falhar o matching de intents do próprio
+# HA, o que empurra um comando de casa para o agente completo do Hermes
+# (10-30 s) em vez de ser resolvido localmente em milissegundos.
+#
+# Só marcadores conhecidos desta lista são removidos — nunca se cortam frases
+# ou palavras "a mais". Texto legítimo como "send Sam a notification (urgent)"
+# ou "como se diz obrigado?" fica intacto, e o texto ENVIADO AO HERMES é
+# sempre o original: a limpeza serve apenas para tentar o caminho local.
+_NON_SPEECH_MARKERS = frozenset(
+    {
+        "applause",
+        "aplausos",
+        "background noise",
+        "blank audio",
+        "blank_audio",
+        "breathing",
+        "cough",
+        "inaudible",
+        "inaudível",
+        "laughter",
+        "music",
+        "musica",
+        "música",
+        "musica de fundo",
+        "música de fundo",
+        "no speech",
+        "noise",
+        "risadas",
+        "risos",
+        "ruido",
+        "ruído",
+        "silence",
+        "silencio",
+        "silêncio",
+        "sneeze",
+        "som",
+        "sound",
+        "static",
+    }
 )
+_MARKER_TAIL = re.compile(r"\s*[\[(]([^\])]*)[\])][\s.,;:!?]*$")
 
 
-def _clean_transcript(text: str) -> str:
-    """Remove o lixo que o Whisper cola no fim da frase.
+def _is_non_speech_marker(inner: str) -> bool:
+    """True quando o conteúdo entre parênteses é um marcador de não-fala."""
+    valor = inner.strip().strip("_").lower()
+    if not valor:
+        return True
+    return valor in _NON_SPEECH_MARKERS or valor.replace("_", " ") in _NON_SPEECH_MARKERS
 
-    Devolve sempre texto nao vazio: se a limpeza esvaziar a frase, devolve o
-    original - nunca fica pior do que veio.
+
+def _strip_non_speech_markers(text: str) -> str:
+    """Remove marcadores de não-fala no fim da transcrição.
+
+    Devolve sempre texto não vazio: se a limpeza esvaziar a frase, devolve o
+    original — nunca fica pior do que veio.
     """
     out = text.strip()
     for _ in range(3):
-        novo = _TRASH_TAIL.sub("", out).strip()
-        novo = _TRASH_WORDS.sub("", novo).strip()
-        if novo == out:
+        match = _MARKER_TAIL.search(out)
+        if match is None or not _is_non_speech_marker(match.group(1)):
             break
-        out = novo
+        out = out[: match.start()].strip()
     return out or text
 
 
-def _local_candidates(text: str):
-    """Candidatos a testar contra o agente nativo, do mais fiel ao mais curto.
+def _truncated_candidates(text: str) -> list[str]:
+    """Cortes da transcrição, do mais longo para o mais curto.
 
-    O Whisper nao cola so palavras soltas: cola FRASES inteiras no fim
-    ("Desligar a luz pequena. Foi bonito.") - impossivel prever todas. Em vez
-    de manter uma lista de lixo, o comando original costuma estar intacto na
-    frente da frase, por isso vai-se cortando a ultima oracao e tentando outra
-    vez. So se aceita um corte quando o HA confirma a execucao (ACTION_DONE),
-    por isso um corte a mais nunca executa nada pela metade.
+    O Whisper também cola FRASES inteiras ("Desligar a luz pequena. Foi
+    bonito."), impossíveis de prever numa lista. Estes cortes servem só para
+    consultas: ver `_local_candidates`.
     """
-    yield text
+    candidatos: list[str] = []
     partes = re.split(r"(?<=[.!?;])\s+", text)
     for n in range(len(partes) - 1, 0, -1):
         candidato = " ".join(partes[:n]).strip()
-        if candidato and candidato != text:
-            yield candidato
-    # Sem pontuacao antes do lixo ("...sala de estar Tchau!"): o corte por
-    # frases nao apanha nada, por isso corta-se tambem a ultima palavra (so 2
-    # tentativas - cada candidato so executa se o HA confirmar ACTION_DONE).
+        if candidato:
+            candidatos.append(candidato)
     palavras = text.split()
     for n in (1, 2):
         if len(palavras) - n >= 2:
-            candidato = " ".join(palavras[:-n]).rstrip(" ,;:")
-            if candidato and candidato != text:
-                yield candidato
+            candidatos.append(" ".join(palavras[:-n]).rstrip(" ,;:"))
+    return [c for c in candidatos if c and c != text]
 
 
-def _resposta_local_valida(result: ConversationResult) -> bool:
-    """Aceitar respostas de CONSULTA do agente nativo (ex.: temperatura).
+def _local_candidates(text: str) -> list[tuple[str, bool]]:
+    """Candidatos a testar no agente nativo: `(texto, pode_executar_ação)`.
 
-    O agente local do HA responde a perguntas de casa em milissegundos
-    (`QUERY_ANSWER`), com frases ja traduzidas. Antes so se aceitavam acoes
-    (`ACTION_DONE`), portanto perguntas simples ("esta quente a cozinha?",
-    "que luzes estao ligadas?", "a janela esta aberta?") gastavam uma volta
-    completa do Hermes (~5,5 s). Se o HA nao tiver frase/intent para a
-    pergunta, devolve erro ou `NOT_UNDERSTOOD` e o pedido segue para o Hermes.
+    `pode_executar_ação` é True apenas para a transcrição verbatim e para a
+    mesma transcrição sem um marcador de não-fala — nesses casos o pedido do
+    utilizador está intacto. Cortes arbitrários NUNCA podem aceitar
+    `ACTION_DONE`: encurtar um comando muda-lhe o sentido ("ligar as luzes
+    excepto a cozinha" → "ligar as luzes"). Em consultas (`QUERY_ANSWER`) um
+    corte é inofensivo, porque não tem efeitos secundários.
     """
-    if intent is None:  # pragma: no cover - HA stubs ausentes
-        return False
-    if result.response.response_type != intent.IntentResponseType.QUERY_ANSWER:
-        return False
-    return bool(_resposta_texto(result))
+    candidatos: list[tuple[str, bool]] = [(text, True)]
+    limpo = _strip_non_speech_markers(text)
+    if limpo != text:
+        candidatos.append((limpo, True))
+    base = limpo or text
+    candidatos.extend((c, False) for c in _truncated_candidates(base))
+
+    vistos: set[str] = set()
+    saida: list[tuple[str, bool]] = []
+    for candidato, pode_agir in candidatos:
+        if candidato and candidato not in vistos:
+            vistos.add(candidato)
+            saida.append((candidato, pode_agir))
+    return saida
 
 
 def _resposta_texto(result: ConversationResult) -> str:
-    """Extrair o texto falado de uma resposta de intent (vazio se nao houver)."""
+    """Extrair o texto falado de uma resposta de intent (vazio se não houver)."""
     try:
         speech = result.response.speech.get("plain") or {}
         texto = speech.get("speech") or ""
@@ -126,6 +175,25 @@ def _resposta_texto(result: ConversationResult) -> str:
     if isinstance(texto, (list, tuple)):
         texto = " ".join(str(p) for p in texto)
     return str(texto).strip()
+
+
+def _tipo_resposta_local(result: ConversationResult) -> str:
+    """Classificar uma resposta do agente nativo: "answer", "action" ou "none".
+
+    - `QUERY_ANSWER` com fala é uma resposta informativa (consulta de casa) —
+      sem efeitos secundários.
+    - `ACTION_DONE` é uma execução (comando de casa).
+    - Erros e `NOT_UNDERSTOOD` devolvem "none" e o pedido segue para o Hermes.
+    """
+    if intent is None:  # pragma: no cover - HA stubs ausentes
+        return "none"
+    response = getattr(result, "response", None)
+    response_type = getattr(response, "response_type", None)
+    if response_type == intent.IntentResponseType.QUERY_ANSWER:
+        return "answer" if _resposta_texto(result) else "none"
+    if response_type == intent.IntentResponseType.ACTION_DONE:
+        return "action"
+    return "none"
 
 
 async def async_setup_entry(
@@ -139,7 +207,7 @@ async def async_setup_entry(
         _LOGGER.warning("Hermes conversation: no bridge found for entry %s", entry.entry_id)
         return
 
-    async_add_entities([HermesConversationAgent(bridge, entry.entry_id)])
+    async_add_entities([HermesConversationAgent(bridge, entry.entry_id, entry)])
 
 
 class HermesConversationAgent(ConversationEntity):
@@ -149,9 +217,20 @@ class HermesConversationAgent(ConversationEntity):
     _attr_name = AGENT_NAME
     _attr_icon = "mdi:robot"
 
-    def __init__(self, bridge: Any, entry_id: str) -> None:
-        """Initialise the Hermes conversation agent."""
+    def __init__(
+        self,
+        bridge: Any,
+        entry_id: str,
+        entry: ConfigEntry | None = None,
+    ) -> None:
+        """Initialise the Hermes conversation agent.
+
+        `entry` é guardado para ler as opções a cada pedido: o HA atualiza as
+        opções no mesmo objeto, por isso mudar o modo local não exige reiniciar
+        o Home Assistant.
+        """
         self._bridge = bridge
+        self._entry = entry
         self._attr_unique_id = f"{DOMAIN}_{entry_id}_conversation"
 
     @property
@@ -164,6 +243,19 @@ class HermesConversationAgent(ConversationEntity):
         configuration.
         """
         return "*"
+
+    @property
+    def local_intents(self) -> str:
+        """Modo de tratamento local: "off", "answers" ou "commands".
+
+        Por omissão "off": este caminho executa intents do HA dentro do próprio
+        HA, sem passar pelo Hermes e portanto sem as listas de bloqueio/
+        audit do plugin do Hermes. Só corre quando o utilizador o liga
+        explicitamente nas opções da integração (ver README).
+        """
+        options = getattr(self._entry, "options", None) or {}
+        modo = options.get(CONF_LOCAL_INTENTS, DEFAULT_LOCAL_INTENTS)
+        return modo if modo in LOCAL_INTENTS_OPTIONS else DEFAULT_LOCAL_INTENTS
 
     @staticmethod
     def _make_error_result(
@@ -182,24 +274,39 @@ class HermesConversationAgent(ConversationEntity):
     async def _try_local_agent(
         self, user_input: ConversationInput, text: str
     ) -> ConversationResult | None:
-        """Tenta resolver o comando com o agente NATIVO do HA.
+        """Tentar resolver o pedido com o agente NATIVO do HA.
 
-        Devolve None quando o comando nao e um comando de casa, para o Hermes
-        tratar dele. So aceita o resultado quando o HA CONFIRMA a execucao
-        (ACTION_DONE) - se o comando nao casar, devolve None e nada se perde.
+        Devolve None quando o pedido não é resolvido localmente, para o Hermes
+        tratar dele. Consultas (`QUERY_ANSWER`) podem ser respondidas a partir
+        de qualquer candidato; comandos (`ACTION_DONE`) só a partir da
+        transcrição intacta (verbatim ou sem um marcador de não-fala) e apenas
+        no modo "commands".
         """
-        if not text:
+        modo = self.local_intents
+        if modo == LOCAL_INTENTS_OFF or not text:
             return None
-        for candidato in _local_candidates(text):
+
+        for candidato, pode_agir in _local_candidates(text):
             resultado = await self._tenta_local(user_input, candidato)
-            if resultado is not None:
+            if resultado is None:
+                continue
+            tipo = _tipo_resposta_local(resultado)
+            if tipo == "answer":
+                _LOGGER.info("Consulta respondida localmente pelo HA: %r", candidato)
+                return resultado
+            if tipo == "action" and pode_agir and modo == LOCAL_INTENTS_COMMANDS:
+                _LOGGER.warning(
+                    "Comando de casa executado localmente pelo HA, sem passar "
+                    "pelo Hermes: %r",
+                    candidato,
+                )
                 return resultado
         return None
 
     async def _tenta_local(
         self, user_input: ConversationInput, text: str
     ) -> ConversationResult | None:
-        """Tenta UM candidato no agente nativo do HA; None se nao resolver."""
+        """Tenta UM candidato no agente nativo do HA; None se não resolver."""
         try:
             from homeassistant.components.conversation import async_get_agent
 
@@ -211,19 +318,12 @@ class HermesConversationAgent(ConversationEntity):
             )
             result = await agent.async_process(local_input)
         except Exception as exc:  # noqa: BLE001 - nunca bloquear o Hermes
-            _LOGGER.debug("Agente nativo do HA indisponivel: %s", exc)
+            _LOGGER.debug("Agente nativo do HA indisponível: %s", exc)
             return None
 
         if not isinstance(result, ConversationResult):
             return None
-        if result.response.response_type == intent.IntentResponseType.ACTION_DONE:
-            _LOGGER.info("Comando de casa resolvido localmente pelo HA: %r", text)
-            return result
-        if _resposta_local_valida(result):
-            _LOGGER.info("Consulta respondida localmente pelo HA: %r", text)
-            return result
-        _LOGGER.debug("HA nao resolveu %r localmente; segue para o Hermes", text)
-        return None
+        return result
 
     async def async_process(self, user_input: ConversationInput) -> ConversationResult:
         """Process a conversation input from the Assist pipeline.
@@ -231,15 +331,11 @@ class HermesConversationAgent(ConversationEntity):
         Forwards the user text to Hermes over the WebSocket bridge
         and returns the agent's response.
         """
-        text = (user_input.text or "").strip()
+        original_text = (user_input.text or "").strip()
+        # O texto entregue ao Hermes é sempre o original: a limpeza de
+        # marcadores de não-fala serve apenas para o teste local.
+        text = original_text
         language = getattr(user_input, "language", None) or "en"
-
-        # Limpar o lixo que o Whisper cola no fim ANTES de decidir: e isso que
-        # devolve os comandos de casa ao caminho instantaneo do HA.
-        cleaned = _clean_transcript(text)
-        if cleaned != text:
-            _LOGGER.info("Transcricao limpa: %r -> %r", text, cleaned)
-            text = cleaned
 
         if not text:
             return self._make_error_result(
@@ -260,10 +356,9 @@ class HermesConversationAgent(ConversationEntity):
 
         conversation_id = user_input.conversation_id
 
-        # Comando de casa? O HA resolve-o localmente em milissegundos. So se
-        # nao casar e que vale a pena gastar uma volta completa do Hermes
-        # (10-30 s) - e, com o HA a desistir aos 30 s, uma volta longa ainda
-        # segura o cadeado da sessao e faz falhar o pedido seguinte.
+        # Pedido de casa? Com o modo local ligado, o HA resolve-o em
+        # milissegundos em vez de gastar uma volta completa do Hermes
+        # (10-30 s).
         local_result = await self._try_local_agent(user_input, text)
         if local_result is not None:
             return local_result

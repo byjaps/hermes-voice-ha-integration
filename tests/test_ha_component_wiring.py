@@ -58,6 +58,14 @@ def test_options_flow_preserves_pending_init_values_until_final_create() -> None
     assert "CONF_WAKE_WORD: normalize_wake_word(DEFAULT_WAKE_WORD)" in source
 
 
+def test_local_intents_option_is_threaded_through_the_options_flow() -> None:
+    source = _source("custom_components/hermes/config_flow.py")
+    assert "CONF_LOCAL_INTENTS: DEFAULT_LOCAL_INTENTS," in source
+    assert source.count("CONF_LOCAL_INTENTS: _parse_local_intents(") == 2
+    conversation = _source("custom_components/hermes/conversation.py")
+    assert "HermesConversationAgent(bridge, entry.entry_id, entry)" in conversation
+
+
 def test_status_sensor_unique_ids_are_entry_scoped() -> None:
     source = _source("custom_components/hermes/sensor.py")
     assert 'self._attr_unique_id = f"{DOMAIN}_{entry_id}_{description.key}"' in source

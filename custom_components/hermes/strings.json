@@ -23,9 +23,13 @@
   "options": {
     "step": {
       "init": {
-        "title": "Allow-listed entities & SSL",
+        "title": "Allow-listed entities, SSL & local handling",
         "data": {
-          "entity_filter": "Entity IDs to monitor (empty = all; one per line or comma-separated)"
+          "entity_filter": "Entity IDs to monitor (empty = all; one per line or comma-separated)",
+          "local_intents": "Local Home Assistant intent handling"
+        },
+        "data_description": {
+          "local_intents": "Off (default): every request goes to Hermes. Answers: Home Assistant answers simple house questions (e.g. room temperature, which lights are on) locally, in milliseconds. Commands: Home Assistant also executes matched house commands locally - these bypass the Hermes allow/block lists and audit log, so only enable this if you accept that trade-off."
         }
       },
       "voice": {

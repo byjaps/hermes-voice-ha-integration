@@ -2,6 +2,17 @@
 
 All notable changes to the hermes-voice-ha-integration project.
 
+## [Unreleased]
+
+### Added
+- **Local Home Assistant intent handling (opt-in)** — new **Local HA intent handling** option (`off` / `answers` / `commands`, default `off`). In `answers` mode Hermes asks HA's native conversation agent (`conversation.home_assistant`) first and speaks `QUERY_ANSWER` results (room temperature, which lights are on, is the window open…) in milliseconds instead of spending a full Hermes round-trip. `commands` mode additionally executes house commands that HA matches on the intact transcript. Both modes are off by default: requests handled locally bypass the Hermes Home Assistant plugin's allow/block lists and audit log (see README → *Local HA intent handling*).
+- Behavioural test coverage for the conversation agent: `QUERY_ANSWER` with and without speech, `ACTION_DONE`, error/unmatched fallback, original-payload preservation, non-speech-marker cleanup, legitimate trailing text, truncated-candidate rejection, the opt-in contract, and the shared query timeout.
+
+### Fixed
+- Transcript cleanup no longer rewrites what is sent to Hermes. Only whisper.cpp non-speech annotations (`[música]`, `(risos)`, `[BLANK_AUDIO]` …) are dropped, and only from the copy used for the local attempt; legitimate trailing text such as `send Sam a notification (urgent)` or `como se diz obrigado?` is untouched, and an unmatched request reaches Hermes byte for byte.
+- Shortened sentence candidates can no longer execute commands. Trimming `ligar todas as luzes excepto a cozinha. Foi bonito.` to `ligar todas as luzes.` reinterpreted the request, so a truncated candidate is now only ever accepted for informational (`QUERY_ANSWER`) results.
+- The 45 s Assist query timeout is now a single constant (`QUERY_TIMEOUT_SECONDS`) used by both `asyncio.wait_for` and the raised `TimeoutError` message, instead of two literals that could drift.
+
 ## [0.0.12] — 2026-06-26
 
 ### Fixed
