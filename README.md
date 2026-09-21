@@ -408,15 +408,17 @@ Values are persisted in the config entry options. After saving, Hermes reads the
 
 ### Local HA intent handling (opt-in, off by default)
 
-Home Assistant ships a native intent engine that answers house questions and runs recognised house commands locally, using HA's own sentence templates — no LLM, milliseconds instead of seconds. Hermes can use HA's strict intent dispatcher before spending a full Hermes round-trip. This deliberately bypasses sentence-trigger automations.
+Home Assistant ships a native intent engine that answers house questions and runs recognised house commands locally, using HA's own sentence templates — no LLM, milliseconds instead of seconds. Hermes can use HA's strict intent dispatcher after a request reaches the selected Hermes agent. This integration-level path deliberately bypasses sentence-trigger automations.
+
+> **Scope:** this option controls only the extra local attempt inside the Hermes agent. Home Assistant itself evaluates sentence-trigger automations before invoking the selected agent, and an Assist pipeline with **Prefer handling commands locally** enabled may execute native intents first. If every request must reach Hermes, disable that pipeline option and review your HA sentence-trigger automations as well as leaving this option `off`.
 
 | Mode | Behaviour |
 |---|---|
-| `off` (default) | Every request goes to Hermes. Nothing is answered or executed locally. |
-| `answers` | HA's strict intent dispatcher filters out everything except known read-only query intents (state, temperature, date/time, and timer status) **before execution**, then speaks a matching answer immediately. Commands are never executed by this mode and are sent to Hermes. |
-| `commands` | As `answers`, plus recognised house-command intents matched **on the intact transcript**. Sentence-trigger automations are not run by this path. |
+| `off` (default) | Every request that reaches the Hermes agent goes to Hermes; this integration performs no additional local handling. It does not disable HA's upstream pipeline routing described above. |
+| `answers` | For requests that reach Hermes, HA's strict intent dispatcher filters out everything except known read-only query intents (state, temperature, date/time, and timer status) **before execution**, then speaks a matching answer immediately. Commands are not executed by this integration-level path and are sent to Hermes. |
+| `commands` | As `answers`, plus recognised house-command intents matched **on the intact transcript**. Sentence-trigger automations are not run by this integration-level path. |
 
-Four safety properties are enforced regardless of the mode:
+Four safety properties apply to this integration-level local path:
 
 - **Local cleanup never rewrites the Hermes payload.** The only cleanup is dropping known whisper.cpp non-speech annotations at the end of a *copy* used for the local attempt (`[música]`, `(risos)`, `[BLANK_AUDIO]` …). If local handling does not match, Hermes receives the exact original transcript, including boundary whitespace.
 - **Oversized requests are rejected, never truncated.** Inputs beyond the 4096-character limit are sent to neither HA's local dispatcher nor Hermes, so truncation cannot turn a qualified request into a different executable command.

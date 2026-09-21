@@ -14,6 +14,8 @@ All notable changes to the hermes-voice-ha-integration project.
 - Removed arbitrary word and sentence truncation from local matching. Multi-clause requests remain intact instead of being answered or executed from a semantically different prefix.
 - Local processing now calls HA's strict intent dispatcher instead of the native agent's full `async_process` path, preventing sentence-trigger automations from executing before a request is classified or executing alongside Hermes.
 - `answers` mode filters by the recognised intent name before the handler executes. This safely returns date, time, and timer queries even when HA labels their read-only responses `ACTION_DONE`, while preventing command handlers from running.
+- `commands` mode no longer falls through to Hermes if HA raises after local intent processing has started, preventing a command from being dispatched twice after a completed side effect.
+- Documentation and option text now distinguish this integration-level setting from HA's upstream sentence-trigger and **Prefer handling commands locally** pipeline routing.
 - The 45 s Assist query timeout is now a single constant (`QUERY_TIMEOUT_SECONDS`) used by both `asyncio.wait_for` and the raised `TimeoutError` message, instead of two literals that could drift.
 
 ## [0.0.12] — 2026-06-26

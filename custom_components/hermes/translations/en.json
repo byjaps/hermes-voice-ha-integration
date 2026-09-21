@@ -29,7 +29,7 @@
           "local_intents": "Local Home Assistant intent handling"
         },
         "data_description": {
-          "local_intents": "Off (default): every request goes to Hermes. Answers: Home Assistant answers simple house questions (e.g. room temperature, which lights are on) locally, in milliseconds. Commands: Home Assistant also executes matched house commands locally - these bypass the Hermes allow/block lists and audit log, so only enable this if you accept that trade-off."
+          "local_intents": "Controls only requests after they reach the Hermes agent. Off (default): Hermes performs no extra local handling. Answers: HA answers known read-only queries locally. Commands: HA also executes recognised command intents locally; these bypass Hermes safety lists and audit logging. HA sentence-trigger automations and a pipeline's 'Prefer handling commands locally' option run upstream and are not disabled here."
         }
       },
       "voice": {

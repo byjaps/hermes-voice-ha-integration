@@ -570,6 +570,32 @@ async def test_commands_mode_executes_an_intact_command_locally() -> None:
 
 
 @needs_stubs
+async def test_commands_mode_never_falls_through_after_handler_failure(
+    monkeypatch,
+) -> None:
+    """A post-action HA failure must not dispatch the command to Hermes again."""
+    text = "ligar a luz pequena"
+    agent, bridge = _make_agent(LOCAL_INTENTS_COMMANDS)
+    local = _use_local_agent({text: (ACTION, "Ligado")})
+    original = _CONVERSATION.async_handle_intents
+
+    async def fail_after_processing(*args, **kwargs):
+        await original(*args, **kwargs)
+        raise RuntimeError("chat log subscriber failed after the service call")
+
+    monkeypatch.setattr(_CONVERSATION, "async_handle_intents", fail_after_processing)
+
+    result = await agent.async_process(_input(text))
+
+    assert local.executions == [text]
+    assert bridge.texts == []
+    assert _speech(result) == (
+        "Home Assistant may have processed that command, but its response failed. "
+        "I won't send it again."
+    )
+
+
+@needs_stubs
 async def test_multi_clause_request_is_never_truncated_or_executed() -> None:
     agent, bridge = _make_agent(LOCAL_INTENTS_COMMANDS)
     local = _use_local_agent({"desligar a luz pequena.": (ACTION, "Desligado")})

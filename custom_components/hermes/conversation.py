@@ -35,6 +35,7 @@ from .const import (
     DEFAULT_LOCAL_INTENTS,
     DOMAIN,
     LOCAL_INTENTS_ANSWERS,
+    LOCAL_INTENTS_COMMANDS,
     LOCAL_INTENTS_OFF,
     LOCAL_INTENTS_OPTIONS,
     MAX_QUERY_TEXT_LENGTH,
@@ -290,7 +291,13 @@ class HermesConversationAgent(ConversationEntity):
                     self.hass,
                     user_input.conversation_id or f"{DOMAIN}-local-{uuid.uuid4()}",
                 )
-            response = await ha_conversation.async_handle_intents(
+            handle_intents = ha_conversation.async_handle_intents
+        except Exception as exc:  # noqa: BLE001 - caminho local é opcional
+            _LOGGER.debug("Agente nativo do HA indisponível: %s", exc)
+            return None
+
+        try:
+            response = await handle_intents(
                 self.hass,
                 local_input,
                 chat_log,
@@ -300,8 +307,20 @@ class HermesConversationAgent(ConversationEntity):
                     else None
                 ),
             )
-        except Exception as exc:  # noqa: BLE001 - nunca bloquear o Hermes
-            _LOGGER.debug("Agente nativo do HA indisponível: %s", exc)
+        except Exception as exc:  # noqa: BLE001 - limite de dupla execução
+            if modo == LOCAL_INTENTS_COMMANDS:
+                _LOGGER.error(
+                    "O intent local pode ter sido executado antes da falha; "
+                    "não será reenviado ao Hermes: %s",
+                    exc,
+                )
+                return self._make_error_result(
+                    getattr(user_input, "language", None) or "en",
+                    "Home Assistant may have processed that command, but its "
+                    "response failed. I won't send it again.",
+                    user_input.conversation_id,
+                )
+            _LOGGER.debug("Consulta local do HA falhou: %s", exc)
             return None
 
         if response is None:
