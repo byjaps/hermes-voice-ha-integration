@@ -12,12 +12,11 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import enum
+import sys
 from types import ModuleType, SimpleNamespace
 from typing import Any
-import sys
 
 import pytest
-
 
 # ---------------------------------------------------------------------------
 # Home Assistant stubs
@@ -52,6 +51,9 @@ def _install_homeassistant_stubs() -> bool:
         "homeassistant.helpers.typing": ModuleType("homeassistant.helpers.typing"),
         "homeassistant.components": ModuleType("homeassistant.components"),
         "homeassistant.components.conversation": ModuleType("homeassistant.components.conversation"),
+        "homeassistant.components.conversation.chat_log": ModuleType(
+            "homeassistant.components.conversation.chat_log"
+        ),
         "homeassistant.components.http": ModuleType("homeassistant.components.http"),
     }
     for name, module in modules.items():
@@ -164,22 +166,49 @@ def _install_homeassistant_stubs() -> bool:
         _attr_has_entity_name = False
         _attr_name: str | None = None
 
-    def async_get_agent(hass: Any, agent_id: str) -> Any:
-        _LOCAL_AGENT_LOOKUPS.append(agent_id)
-        return _LOCAL_AGENT["agent"]
+    class ChatLog:
+        def __init__(self, hass: Any, conversation_id: str) -> None:
+            self.hass = hass
+            self.conversation_id = conversation_id
+
+    class _CurrentChatLog:
+        @staticmethod
+        def get() -> None:
+            return None
+
+    async def async_handle_intents(
+        hass: Any,
+        user_input: ConversationInput,
+        chat_log: ChatLog,
+        intent_filter=None,
+    ) -> Any:
+        _LOCAL_AGENT_LOOKUPS.append(user_input.agent_id)
+        agent = _LOCAL_AGENT["agent"]
+        if agent is None:
+            return None
+        recognised = await agent.async_recognize_intent(user_input)
+        if recognised is None or (
+            intent_filter is not None and intent_filter(recognised)
+        ):
+            return None
+        return await agent.async_process_intent(user_input)
 
     conv.ConversationInput = ConversationInput
     conv.ConversationResult = ConversationResult
     conv.ConversationEntity = ConversationEntity
-    conv.async_get_agent = async_get_agent
+    setattr(conv, "async_handle_intents", async_handle_intents)
+    setattr(sys.modules["homeassistant.components"], "conversation", conv)
+    chat_log_mod = sys.modules["homeassistant.components.conversation.chat_log"]
+    setattr(chat_log_mod, "ChatLog", ChatLog)
+    setattr(chat_log_mod, "current_chat_log", _CurrentChatLog())
     return True
 
 
 HA_STUBBED = _install_homeassistant_stubs()
 
 from custom_components.hermes import QUERY_TIMEOUT_SECONDS
-from custom_components.hermes import conversation as agent_module
 from custom_components.hermes import config_flow as config_flow_module
+from custom_components.hermes import conversation as agent_module
 from custom_components.hermes.const import (
     CONF_LOCAL_INTENTS,
     DOMAIN,
@@ -219,8 +248,13 @@ class FakeLocalAgent:
     is answered with an error, exactly like an unmatched sentence.
     """
 
-    def __init__(self, answers: dict[str, tuple[str, str]]) -> None:
+    def __init__(
+        self,
+        answers: dict[str, tuple[str, str]],
+        intent_names: dict[str, str] | None = None,
+    ) -> None:
         self.answers = answers
+        self.intent_names = intent_names or {}
         self.calls: list[str] = []
         self.recognitions: list[str] = []
         self.executions: list[str] = []
@@ -232,19 +266,22 @@ class FakeLocalAgent:
         if answer is None:
             return None
         kind, _speech = answer
-        intent_name = "HassGetState" if kind == ANSWER else "HassTurnOn"
+        intent_name = self.intent_names.get(
+            user_input.text,
+            "HassGetState" if kind == ANSWER else "HassTurnOn",
+        )
         return SimpleNamespace(
             intent=SimpleNamespace(name=intent_name), unmatched_entities=[]
         )
 
-    async def async_process(self, user_input):
+    async def async_process_intent(self, user_input):
         self.calls.append(user_input.text)
         if user_input.text not in self.answers:
-            return _local_result(ANSWER, "")
+            return _local_result(ANSWER, "").response
         kind, speech = self.answers[user_input.text]
         if kind == ACTION:
             self.executions.append(user_input.text)
-        return _local_result(kind, speech)
+        return _local_result(kind, speech).response
 
 
 class FakeBridge:
@@ -275,8 +312,11 @@ def _make_agent(
     return agent, bridge
 
 
-def _use_local_agent(answers: dict[str, tuple[str, str]]) -> FakeLocalAgent:
-    fake = FakeLocalAgent(answers)
+def _use_local_agent(
+    answers: dict[str, tuple[str, str]],
+    intent_names: dict[str, str] | None = None,
+) -> FakeLocalAgent:
+    fake = FakeLocalAgent(answers, intent_names)
     _LOCAL_AGENT["agent"] = fake
     _LOCAL_AGENT_LOOKUPS.clear()
     return fake
@@ -411,23 +451,26 @@ async def test_hermes_receives_the_original_transcript() -> None:
     agent, bridge = _make_agent(LOCAL_INTENTS_COMMANDS)
     local = _use_local_agent({})
 
-    result = await agent.async_process(_input("que luzes estão ligadas? [música]"))
+    text = "  que luzes estão ligadas? [música]  "
+    result = await agent.async_process(_input(text))
 
-    assert bridge.texts == ["que luzes estão ligadas? [música]"]
+    assert bridge.texts == [text]
     assert _speech(result) == "resposta do Hermes"
     # The cleanup was still used for the local attempt itself.
-    assert "que luzes estão ligadas?" in local.calls
+    assert local.recognitions == ["que luzes estão ligadas?"]
 
 
 @needs_stubs
-async def test_hermes_payload_is_truncated_at_max_length() -> None:
+async def test_over_limit_payload_is_rejected_without_execution() -> None:
     agent, bridge = _make_agent(LOCAL_INTENTS_COMMANDS)
     long_text = "a" * (MAX_QUERY_TEXT_LENGTH + 10)
     local = _use_local_agent({long_text[:MAX_QUERY_TEXT_LENGTH]: (ACTION, "Ligado")})
 
-    await agent.async_process(_input(long_text))
+    result = await agent.async_process(_input(long_text))
 
-    assert bridge.texts == [long_text[:MAX_QUERY_TEXT_LENGTH]]
+    assert bridge.texts == []
+    assert _speech(result) == "That request is too long. Please shorten it."
+    assert local.recognitions == []
     assert local.calls == []
     assert local.executions == []
 
@@ -444,6 +487,23 @@ async def test_query_answer_is_returned_locally() -> None:
 
     assert _speech(result) == "22 graus"
     assert bridge.texts == []
+
+
+@needs_stubs
+async def test_read_only_intent_with_action_done_response_is_returned_locally() -> None:
+    """HA's date/time handlers are safe but retain ACTION_DONE response type."""
+    text = "what time is it"
+    agent, bridge = _make_agent(LOCAL_INTENTS_ANSWERS)
+    local = _use_local_agent(
+        {text: (ACTION, "It is 11:42")},
+        {text: "HassGetCurrentTime"},
+    )
+
+    result = await agent.async_process(_input(text))
+
+    assert _speech(result) == "It is 11:42"
+    assert bridge.texts == []
+    assert local.executions == [text]
 
 
 @needs_stubs
@@ -517,7 +577,8 @@ async def test_multi_clause_request_is_never_truncated_or_executed() -> None:
     text = "desligar a luz pequena. afinal, não desligues."
     result = await agent.async_process(_input(text))
 
-    assert local.calls == [text]
+    assert local.recognitions == [text]
+    assert local.calls == []
     assert local.executions == []
     assert bridge.texts == [text]
     assert _speech(result) == "resposta do Hermes"

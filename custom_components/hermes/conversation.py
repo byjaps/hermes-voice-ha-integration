@@ -10,6 +10,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import re
+import uuid
 from typing import Any
 
 try:
@@ -34,7 +35,6 @@ from .const import (
     DEFAULT_LOCAL_INTENTS,
     DOMAIN,
     LOCAL_INTENTS_ANSWERS,
-    LOCAL_INTENTS_COMMANDS,
     LOCAL_INTENTS_OFF,
     LOCAL_INTENTS_OPTIONS,
     MAX_QUERY_TEXT_LENGTH,
@@ -96,10 +96,7 @@ _NON_SPEECH_MARKERS = frozenset(
 )
 _MARKER_TAIL = re.compile(r"\s*[\[(]([^\])]*)[\])][\s.,;:!?]*$")
 
-# Home Assistant's native agent executes a matched intent inside
-# ``async_process``. In answers-only mode, recognise first and only execute
-# built-in query intents whose handlers are read-only. This prevents a command
-# from running locally before its ACTION_DONE response can be inspected.
+# Only these read-only intent handlers may execute in answers-only mode.
 _SAFE_LOCAL_QUERY_INTENTS = frozenset(
     {
         "HassClimateGetTemperature",
@@ -109,6 +106,12 @@ _SAFE_LOCAL_QUERY_INTENTS = frozenset(
         "HassTimerStatus",
     }
 )
+
+
+def _exclude_non_query_intents(result: Any) -> bool:
+    """Return True when HA must not execute this result in answers mode."""
+    intent_name = getattr(getattr(result, "intent", None), "name", None)
+    return intent_name not in _SAFE_LOCAL_QUERY_INTENTS
 
 
 def _is_non_speech_marker(inner: str) -> bool:
@@ -154,25 +157,6 @@ def _resposta_texto(result: ConversationResult) -> str:
     if isinstance(texto, (list, tuple)):
         texto = " ".join(str(p) for p in texto)
     return str(texto).strip()
-
-
-def _tipo_resposta_local(result: ConversationResult) -> str:
-    """Classificar uma resposta do agente nativo: "answer", "action" ou "none".
-
-    - `QUERY_ANSWER` com fala é uma resposta informativa (consulta de casa) —
-      sem efeitos secundários.
-    - `ACTION_DONE` é uma execução (comando de casa).
-    - Erros e `NOT_UNDERSTOOD` devolvem "none" e o pedido segue para o Hermes.
-    """
-    if intent is None:  # pragma: no cover - HA stubs ausentes
-        return "none"
-    response = getattr(result, "response", None)
-    response_type = getattr(response, "response_type", None)
-    if response_type == intent.IntentResponseType.QUERY_ANSWER:
-        return "answer" if _resposta_texto(result) else "none"
-    if response_type == intent.IntentResponseType.ACTION_DONE:
-        return "action"
-    return "none"
 
 
 async def async_setup_entry(
@@ -253,13 +237,14 @@ class HermesConversationAgent(ConversationEntity):
     async def _try_local_agent(
         self, user_input: ConversationInput, text: str
     ) -> ConversationResult | None:
-        """Tentar resolver o pedido com o agente NATIVO do HA.
+        """Tentar resolver o pedido pelo caminho estrito de intents do HA.
 
         Devolve None quando o pedido não é resolvido localmente, para o Hermes
-        tratar dele. Em modo "answers", o agente nativo reconhece primeiro o
-        intent sem o executar; apenas intents de consulta conhecidos são então
-        processados. Em modo "commands", o utilizador optou explicitamente por
-        permitir a execução local de comandos.
+        tratar dele. Este caminho ignora automações de sentence trigger. Em
+        modo "answers", um filtro impede a execução de qualquer intent que não
+        esteja na lista de consultas conhecidas. Em modo "commands", o
+        utilizador optou explicitamente por permitir a execução local dos
+        restantes intents reconhecidos.
         """
         modo = self.local_intents
         if modo == LOCAL_INTENTS_OFF or not text:
@@ -270,59 +255,61 @@ class HermesConversationAgent(ConversationEntity):
         if resultado is None:
             return None
 
-        tipo = _tipo_resposta_local(resultado)
-        if tipo == "answer":
+        if modo == LOCAL_INTENTS_ANSWERS:
+            if not _resposta_texto(resultado):
+                return None
             _LOGGER.info("Consulta respondida localmente pelo HA: %r", candidato)
             return resultado
-        if tipo == "action" and modo == LOCAL_INTENTS_COMMANDS:
-            _LOGGER.warning(
-                "Comando de casa executado localmente pelo HA, sem passar "
-                "pelo Hermes: %r",
-                candidato,
-            )
-            return resultado
-        return None
+
+        _LOGGER.warning(
+            "Intent do HA processado localmente, sem passar pelo Hermes: %r",
+            candidato,
+        )
+        # A returned response means HA matched and processed the strict intent.
+        # Return errors too: falling through after a handler error could execute
+        # the same command a second time through Hermes.
+        return resultado
 
     async def _tenta_local(
         self, user_input: ConversationInput, text: str, modo: str
     ) -> ConversationResult | None:
-        """Tenta UM candidato no agente nativo do HA; None se não resolver."""
+        """Tenta UM candidato pelo caminho estrito de intents do HA."""
         try:
-            from homeassistant.components.conversation import async_get_agent
+            from homeassistant.components import conversation as ha_conversation
+            from homeassistant.components.conversation.chat_log import (
+                ChatLog,
+                current_chat_log,
+            )
 
-            agent = async_get_agent(self.hass, LOCAL_AGENT_ID)
-            if agent is None:
-                return None
             local_input = dataclasses.replace(
                 user_input, text=text, agent_id=LOCAL_AGENT_ID
             )
-
-            if modo == LOCAL_INTENTS_ANSWERS:
-                # ``async_process`` runs the intent before returning its result,
-                # so classifying ACTION_DONE afterwards is too late. The native
-                # DefaultAgent exposes a side-effect-free recogniser in current
-                # Home Assistant. If unavailable, fail closed to Hermes.
-                reconhecer = getattr(agent, "async_recognize_intent", None)
-                if reconhecer is None:
-                    return None
-                reconhecimento = await reconhecer(local_input)
-                intent_name = getattr(
-                    getattr(reconhecimento, "intent", None), "name", None
+            chat_log = current_chat_log.get()
+            if chat_log is None:
+                chat_log = ChatLog(
+                    self.hass,
+                    user_input.conversation_id or f"{DOMAIN}-local-{uuid.uuid4()}",
                 )
-                if (
-                    intent_name not in _SAFE_LOCAL_QUERY_INTENTS
-                    or getattr(reconhecimento, "unmatched_entities", ())
-                ):
-                    return None
-
-            result = await agent.async_process(local_input)
+            response = await ha_conversation.async_handle_intents(
+                self.hass,
+                local_input,
+                chat_log,
+                intent_filter=(
+                    _exclude_non_query_intents
+                    if modo == LOCAL_INTENTS_ANSWERS
+                    else None
+                ),
+            )
         except Exception as exc:  # noqa: BLE001 - nunca bloquear o Hermes
             _LOGGER.debug("Agente nativo do HA indisponível: %s", exc)
             return None
 
-        if not isinstance(result, ConversationResult):
+        if response is None:
             return None
-        return result
+        return ConversationResult(
+            response=response,
+            conversation_id=user_input.conversation_id,
+        )
 
     async def async_process(self, user_input: ConversationInput) -> ConversationResult:
         """Process a conversation input from the Assist pipeline.
@@ -330,39 +317,39 @@ class HermesConversationAgent(ConversationEntity):
         Forwards the user text to Hermes over the WebSocket bridge
         and returns the agent's response.
         """
-        # Preserve the integration's established whitespace normalisation and
-        # maximum WebSocket payload, while ensuring local cleanup never changes
-        # what is sent to Hermes.
-        text = (user_input.text or "").strip()
+        # Keep the original transcript byte-for-byte for Hermes. Normalisation
+        # is only allowed on the isolated local-recognition candidate.
+        text = user_input.text or ""
         language = getattr(user_input, "language", None) or "en"
+        conversation_id = user_input.conversation_id
 
-        if not text:
+        if not text.strip():
             return self._make_error_result(
                 language,
                 "I didn't catch that. Could you repeat?",
-                user_input.conversation_id,
+                conversation_id,
             )
 
-        # Enforce a reasonable maximum input length to prevent oversized
-        # WebSocket frames and memory pressure from developer-tool bypasses.
-        allow_local = len(text) <= MAX_QUERY_TEXT_LENGTH
-        if not allow_local:
+        # Never turn an oversized request into a different executable request
+        # by truncating it. Reject it before either local or Hermes processing.
+        if len(text) > MAX_QUERY_TEXT_LENGTH:
             _LOGGER.warning(
-                "Truncating conversation query from %d to %d chars",
+                "Rejecting conversation query of %d chars (maximum %d)",
                 len(text),
                 MAX_QUERY_TEXT_LENGTH,
             )
-            text = text[:MAX_QUERY_TEXT_LENGTH]
-
-        conversation_id = user_input.conversation_id
+            return self._make_error_result(
+                language,
+                "That request is too long. Please shorten it.",
+                conversation_id,
+            )
 
         # Pedido de casa? Com o modo local ligado, o HA resolve-o em
         # milissegundos em vez de gastar uma volta completa do Hermes
         # (10-30 s).
-        if allow_local:
-            local_result = await self._try_local_agent(user_input, text)
-            if local_result is not None:
-                return local_result
+        local_result = await self._try_local_agent(user_input, text)
+        if local_result is not None:
+            return local_result
 
         try:
             result = await self._bridge.async_send_conversation_query(

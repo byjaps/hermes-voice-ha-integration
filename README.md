@@ -408,21 +408,22 @@ Values are persisted in the config entry options. After saving, Hermes reads the
 
 ### Local HA intent handling (opt-in, off by default)
 
-Home Assistant ships a native conversation agent (`conversation.home_assistant`) that answers house questions and runs house commands locally, using HA's own sentence templates — no LLM, milliseconds instead of seconds. Hermes can hand a request to that agent before spending a full Hermes round-trip.
+Home Assistant ships a native intent engine that answers house questions and runs recognised house commands locally, using HA's own sentence templates — no LLM, milliseconds instead of seconds. Hermes can use HA's strict intent dispatcher before spending a full Hermes round-trip. This deliberately bypasses sentence-trigger automations.
 
 | Mode | Behaviour |
 |---|---|
 | `off` (default) | Every request goes to Hermes. Nothing is answered or executed locally. |
-| `answers` | Hermes first uses HA's side-effect-free intent recogniser. Only known read-only query intents (state, temperature, date/time, and timer status) are then processed locally and spoken immediately. Commands are never executed by this mode and are sent to Hermes. |
-| `commands` | As `answers`, plus house commands (`ACTION_DONE`) that HA matches **on the intact transcript** are executed locally instead of going to Hermes. |
+| `answers` | HA's strict intent dispatcher filters out everything except known read-only query intents (state, temperature, date/time, and timer status) **before execution**, then speaks a matching answer immediately. Commands are never executed by this mode and are sent to Hermes. |
+| `commands` | As `answers`, plus recognised house-command intents matched **on the intact transcript**. Sentence-trigger automations are not run by this path. |
 
-Three safety properties are enforced regardless of the mode:
+Four safety properties are enforced regardless of the mode:
 
-- **Local cleanup never rewrites the Hermes payload.** The only cleanup is dropping known whisper.cpp non-speech annotations at the end of a *copy* used for the local attempt (`[música]`, `(risos)`, `[BLANK_AUDIO]` …). If local handling does not match, Hermes receives the same whitespace-normalised, length-capped text it received before this option existed.
+- **Local cleanup never rewrites the Hermes payload.** The only cleanup is dropping known whisper.cpp non-speech annotations at the end of a *copy* used for the local attempt (`[música]`, `(risos)`, `[BLANK_AUDIO]` …). If local handling does not match, Hermes receives the exact original transcript, including boundary whitespace.
+- **Oversized requests are rejected, never truncated.** Inputs beyond the 4096-character limit are sent to neither HA's local dispatcher nor Hermes, so truncation cannot turn a qualified request into a different executable command.
 - **Words and clauses are never guessed away.** The local path does not shorten sentences or remove ordinary trailing words. A multi-clause request therefore stays intact and falls through to Hermes when HA cannot match it as written.
-- **`answers` mode recognises before it executes.** HA's native `async_process` call can run actions before returning `ACTION_DONE`, so the integration first uses the side-effect-free recogniser and permits only a small allow-list of built-in query intent names.
+- **`answers` mode filters before execution.** Only a small allow-list of read-only built-in query intent names reaches HA's intent handlers. This is based on the matched intent name rather than `response_type`, because HA's date, time, and timer handlers may return `ACTION_DONE` despite being read-only.
 
-> **Security note (`commands` mode):** requests handled locally never reach Hermes, so they are not filtered by the Hermes Home Assistant plugin's allow-list/block-list and never appear in its audit log. Home Assistant's own boundaries still apply — intents can only reach entities you exposed to Assist. Turn `commands` on only if that trade-off is acceptable; leave it `off` if your allow-list is what keeps unsafe entities out of voice control.
+> **Security note (`commands` mode):** requests handled locally never reach Hermes, so they are not filtered by the Hermes Home Assistant plugin's allow-list/block-list and never appear in its audit log. The path executes recognised HA intents only and does not run sentence-trigger automations. Home Assistant's own entity-exposure boundaries still apply. Turn `commands` on only if that trade-off is acceptable; leave it `off` if your allow-list is what keeps unsafe entities out of voice control.
 
 ---
 
