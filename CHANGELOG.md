@@ -2,14 +2,29 @@
 
 All notable changes to the hermes-voice-ha-integration project.
 
-## [0.0.14] — 2026-09-14
+## [0.0.14] — 2026-09-21
+
+### Added
+- **Local Home Assistant intent handling (opt-in)** — new **Local HA intent handling** option (`off` / `answers` / `commands`, default `off`). `answers` mode uses HA's strict intent dispatcher with a pre-execution allow-list of known read-only query intents, returning results such as room temperature, entity state, date/time, or timer status in milliseconds. `commands` mode additionally executes recognised house-command intents matched on the intact transcript. Both modes bypass sentence-trigger automations inside the integration path; requests handled locally bypass the Hermes plugin's allow-list, block-list, and audit log. ([#46](https://github.com/rusty4444/hermes-voice-ha-integration/pull/46), thanks @byjaps.)
+- Behavioural coverage for local-intent safety, exact Hermes-payload preservation, non-speech-marker cleanup, multi-clause preservation, options-flow persistence, and the shared query timeout.
 
 ### Fixed
-- Made frontend static-route registration idempotent so reloading the config entry on Home Assistant 2026.9+ does not abort setup with aiohttp's duplicate GET route error.
+- Made frontend static-route registration idempotent so reloading the config entry on Home Assistant 2026.9+ does not abort setup with aiohttp's duplicate GET route error. ([#44](https://github.com/rusty4444/hermes-voice-ha-integration/pull/44); addresses [#43](https://github.com/rusty4444/hermes-voice-ha-integration/issues/43), reported by @EdwardMoyse.)
+- Added explicit reconnect-task ownership, retry backoff, and WebSocket/session cleanup so failed reconnects and shutdowns do not leak resources. ([#42](https://github.com/rusty4444/hermes-voice-ha-integration/pull/42), thanks @byjaps.)
+- Local intent processing no longer executes sentence-trigger automations, truncates requests into different commands, alters Hermes fallback payloads, or dispatches a command twice after a post-side-effect HA failure.
+- `answers` mode filters by recognised read-only intent name before execution and correctly returns HA date, time, and timer handlers even when they report `ACTION_DONE`.
+- Oversized transcripts are rejected before local or Hermes processing rather than silently truncated.
+- The Assist query timeout is consistently 45 seconds in both runtime behaviour and its error message.
 
 ### Documentation
+- Clarified that the integration-level local-intent setting does not disable HA's upstream sentence-trigger automations or **Prefer handling commands locally** pipeline option.
 - Corrected the Hermes plugin check and WebSocket test commands.
 - Synchronised release metadata across the Python package, HACS manifest, add-on config, and bundled Hermes plugins.
+
+## [0.0.13] — 2026-07-11
+
+### Documentation
+- Clarified how this project coexists with Hermes Agent's bundled Home Assistant integration. ([#39](https://github.com/rusty4444/hermes-voice-ha-integration/pull/39)).
 
 ## [0.0.12] — 2026-06-26
 
