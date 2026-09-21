@@ -27,7 +27,7 @@ This repository is a bundle of three pieces:
 
 The Python wheel is intentionally plugin-focused. Use the GitHub tag or source distribution for the full HACS/custom-component/add-on bundle.
 
-> **Release:** `v0.0.12` — ships the Hermes-side `assist_query` receiver and bumps all install surfaces past the stale `v0.0.11` metadata.
+> **Release:** `v0.0.14` — adds opt-in, safety-filtered local HA intent handling, hardens reconnect cleanup, and fixes config-entry reloads on Home Assistant 2026.9+.
 
 ---
 
@@ -162,7 +162,7 @@ Keep this token private. It can control your Home Assistant instance with your a
 Install or upgrade the package directly from GitHub, then run the bundled plugin installer:
 
 ```bash
-python3 -m pip install --upgrade "hermes-voice-ha-integration @ git+https://github.com/rusty4444/hermes-voice-ha-integration.git@v0.0.12"
+python3 -m pip install --upgrade "hermes-voice-ha-integration @ git+https://github.com/rusty4444/hermes-voice-ha-integration.git@v0.0.14"
 hermes-ha-install-plugins
 ```
 
