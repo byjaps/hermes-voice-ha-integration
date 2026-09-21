@@ -19,9 +19,21 @@ CONF_WAKE_WORD_ENGINE = "wake_word_engine"
 CONF_WAKE_WORD = "wake_word"
 CONF_MEDIA_PLAYER = "media_player_entity"
 
+# Conversation agent: local (Home Assistant native) intent handling
+CONF_LOCAL_INTENTS = "local_intents"
+LOCAL_INTENTS_OFF = "off"
+LOCAL_INTENTS_ANSWERS = "answers"
+LOCAL_INTENTS_COMMANDS = "commands"
+LOCAL_INTENTS_OPTIONS = [
+    LOCAL_INTENTS_OFF,
+    LOCAL_INTENTS_ANSWERS,
+    LOCAL_INTENTS_COMMANDS,
+]
+
 # Defaults
 DEFAULT_ENTITY_FILTER: list[str] = []
 DEFAULT_VERIFY_SSL: bool = True
+DEFAULT_LOCAL_INTENTS: str = LOCAL_INTENTS_OFF
 
 # Engine / model defaults
 DEFAULT_TTS_ENGINE = "edge"

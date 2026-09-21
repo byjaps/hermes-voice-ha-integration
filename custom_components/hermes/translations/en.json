@@ -23,9 +23,13 @@
   "options": {
     "step": {
       "init": {
-        "title": "Allow-listed entities & SSL",
+        "title": "Allow-listed entities, SSL & local handling",
         "data": {
-          "entity_filter": "Entity IDs to monitor (empty = all; one per line or comma-separated)"
+          "entity_filter": "Entity IDs to monitor (empty = all; one per line or comma-separated)",
+          "local_intents": "Local Home Assistant intent handling"
+        },
+        "data_description": {
+          "local_intents": "Controls only requests after they reach the Hermes agent. Off (default): Hermes performs no extra local handling. Answers: HA answers known read-only queries locally. Commands: HA also executes recognised command intents locally; these bypass Hermes safety lists and audit logging. HA sentence-trigger automations and a pipeline's 'Prefer handling commands locally' option run upstream and are not disabled here."
         }
       },
       "voice": {

@@ -37,6 +37,12 @@ PLATFORMS: list[Platform | str] = [Platform.SENSOR, _CONVERSATION_PLATFORM]
 _PUSH_INTERVAL = timedelta(seconds=0.2)
 _LAST_PUSH: dict[str, float] = {}
 
+# A single source of truth for the Assist query timeout. Multi-tool Hermes
+# turns regularly exceed 30 s, and the old error message kept saying
+# "within 30 seconds" after the value changed, so the message is built from
+# this constant.
+QUERY_TIMEOUT_SECONDS = 45.0
+
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the Hermes integration via configuration.yaml (legacy)."""
@@ -436,11 +442,13 @@ class HermesBridge:
             raise ConnectionError("Hermes WebSocket not connected")
 
         try:
-            result = await asyncio.wait_for(future, timeout=30.0)
+            result = await asyncio.wait_for(future, timeout=QUERY_TIMEOUT_SECONDS)
             return result
         except asyncio.TimeoutError:
             self._pending_queries.pop(conversation_id, None)
-            raise TimeoutError("Hermes did not respond within 30 seconds")
+            raise TimeoutError(
+                f"Hermes did not respond within {QUERY_TIMEOUT_SECONDS:.0f} seconds"
+            )
 
     async def async_shutdown(self) -> None:
         """Clean up connections."""

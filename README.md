@@ -352,7 +352,7 @@ Do **not** enter `http://homeassistant.local:8123` in the Hermes URL field. That
 
 This integration registers a Home Assistant Assist conversation agent (`HermesConversationAgent`) on the `Platform.CONVERSATION` platform and handles both incoming `assist_query` and outgoing `assist_response` WebSocket messages. After setup, Hermes will appear in the **Preferred conversation agent** selector under **Settings → Voice assistants**.
 
-> **Important:** The Hermes Agent server must handle the `assist_query` and `assist_response` WebSocket message types for the conversation pipeline to work end-to-end. The HA integration forwards queries and awaits responses, but if the Hermes Agent does not recognise these message types, conversation queries time out after 30 seconds. See [Hermes Agent WebSocket message types](#hermes-agent-websocket-message-types) below for the protocol contract.
+> **Important:** The Hermes Agent server must handle the `assist_query` and `assist_response` WebSocket message types for the conversation pipeline to work end-to-end. The HA integration forwards queries and awaits responses, but if the Hermes Agent does not recognise these message types, conversation queries time out after 45 seconds. See [Hermes Agent WebSocket message types](#hermes-agent-websocket-message-types) below for the protocol contract.
 
 5. Submit.
 
@@ -380,12 +380,13 @@ After adding the integration, open **Settings → Devices &amp; services → Her
 
 The options flow has two pages.
 
-### Page 1 — Allow-listed entities &amp; SSL
+### Page 1 — Allow-listed entities, SSL &amp; local handling
 
 | Field | What to enter |
 |---|---|
 | **Entity IDs to monitor** | One entity per line or comma-separated (empty = all entities) |
 | **Verify SSL certificates** | Toggle off if your Hermes endpoint uses a self-signed cert |
+| **Local HA intent handling** | `off` (default), `answers`, or `commands` — see below |
 
 ### Page 2 — Voice pipeline
 
@@ -404,6 +405,27 @@ The options flow has two pages.
 | **Media player entity ID** | HA `media_player.*` entity used for TTS playback (e.g. `media_player.living_room_speaker`) |
 
 Values are persisted in the config entry options. After saving, Hermes reads them from `entry.options` on every restart. Screenshots of the live UI are welcome via PR.
+
+### Local HA intent handling (opt-in, off by default)
+
+Home Assistant ships a native intent engine that answers house questions and runs recognised house commands locally, using HA's own sentence templates — no LLM, milliseconds instead of seconds. Hermes can use HA's strict intent dispatcher after a request reaches the selected Hermes agent. This integration-level path deliberately bypasses sentence-trigger automations.
+
+> **Scope:** this option controls only the extra local attempt inside the Hermes agent. Home Assistant itself evaluates sentence-trigger automations before invoking the selected agent, and an Assist pipeline with **Prefer handling commands locally** enabled may execute native intents first. If every request must reach Hermes, disable that pipeline option and review your HA sentence-trigger automations as well as leaving this option `off`.
+
+| Mode | Behaviour |
+|---|---|
+| `off` (default) | Every request that reaches the Hermes agent goes to Hermes; this integration performs no additional local handling. It does not disable HA's upstream pipeline routing described above. |
+| `answers` | For requests that reach Hermes, HA's strict intent dispatcher filters out everything except known read-only query intents (state, temperature, date/time, and timer status) **before execution**, then speaks a matching answer immediately. Commands are not executed by this integration-level path and are sent to Hermes. |
+| `commands` | As `answers`, plus recognised house-command intents matched **on the intact transcript**. Sentence-trigger automations are not run by this integration-level path. |
+
+Four safety properties apply to this integration-level local path:
+
+- **Local cleanup never rewrites the Hermes payload.** The only cleanup is dropping known whisper.cpp non-speech annotations at the end of a *copy* used for the local attempt (`[música]`, `(risos)`, `[BLANK_AUDIO]` …). If local handling does not match, Hermes receives the exact original transcript, including boundary whitespace.
+- **Oversized requests are rejected, never truncated.** Inputs beyond the 4096-character limit are sent to neither HA's local dispatcher nor Hermes, so truncation cannot turn a qualified request into a different executable command.
+- **Words and clauses are never guessed away.** The local path does not shorten sentences or remove ordinary trailing words. A multi-clause request therefore stays intact and falls through to Hermes when HA cannot match it as written.
+- **`answers` mode filters before execution.** Only a small allow-list of read-only built-in query intent names reaches HA's intent handlers. This is based on the matched intent name rather than `response_type`, because HA's date, time, and timer handlers may return `ACTION_DONE` despite being read-only.
+
+> **Security note (`commands` mode):** requests handled locally never reach Hermes, so they are not filtered by the Hermes Home Assistant plugin's allow-list/block-list and never appear in its audit log. The path executes recognised HA intents only and does not run sentence-trigger automations. Home Assistant's own entity-exposure boundaries still apply. Turn `commands` on only if that trade-off is acceptable; leave it `off` if your allow-list is what keeps unsafe entities out of voice control.
 
 ---
 
@@ -719,7 +741,7 @@ HASS_URL=http://192.168.1.50:8123
 
 ### Assist pipeline times out with "Sorry, I couldn't reach Hermes"
 
-This means the HA integration sent an `assist_query` WebSocket message but never received an `assist_response` within 30 seconds.
+This means the HA integration sent an `assist_query` WebSocket message but never received an `assist_response` within 45 seconds.
 
 **Check:**
 - Confirm the Hermes Agent server recognises the `assist_query` message type. If the WebSocket reader discards unknown types, no response is ever sent.
@@ -767,7 +789,7 @@ Check:
 
 ## Hermes Agent WebSocket message types
 
-The Home Assistant integration communicates with the Hermes Agent server over WebSocket. For the Assist pipeline conversation agent to function, the Hermes Agent server **must** handle these message types. Without them, the pipeline handshake succeeds but all conversation queries time out after 30 seconds.
+The Home Assistant integration communicates with the Hermes Agent server over WebSocket. For the Assist pipeline conversation agent to function, the Hermes Agent server **must** handle these message types. Without them, the pipeline handshake succeeds but all conversation queries time out after 45 seconds.
 
 ### `assist_query` — incoming (Hermes Agent receives)
 
@@ -823,7 +845,7 @@ After processing the query, the Hermes Agent server must send back this response
 4. Hermes Agent sends `assist_response` with the answer.
 5. HA Assist pipeline renders the response in its UI and/or speaks it via TTS.
 
-If no response is received within 30 seconds, the pipeline falls back to an error speech message ("Sorry, I couldn't reach Hermes").
+If no response is received within 45 seconds, the pipeline falls back to an error speech message ("Sorry, I couldn't reach Hermes").
 
 ### Implementation reference
 
@@ -831,7 +853,7 @@ The reader task in `custom_components/hermes/__init__.py` routes incoming messag
 
 ### Known limitations on the Hermes Agent side
 
-- If the Hermes Agent does not recognise the `assist_query` type, the WebSocket reader discards it as unknown and no response is ever sent → 30-second timeout.
+- If the Hermes Agent does not recognise the `assist_query` type, the WebSocket reader discards it as unknown and no response is ever sent → 45-second timeout.
 - If the Hermes Agent sends a response with a mismatched `conversation_id`, the future lookup in the HA integration fails and the response is dropped.
 - The conversation agent expects exactly one `assist_response` per `assist_query`. Sending multiple responses for the same `conversation_id` will deliver only the first one.
 
