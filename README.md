@@ -352,7 +352,7 @@ Do **not** enter `http://homeassistant.local:8123` in the Hermes URL field. That
 
 This integration registers a Home Assistant Assist conversation agent (`HermesConversationAgent`) on the `Platform.CONVERSATION` platform and handles both incoming `assist_query` and outgoing `assist_response` WebSocket messages. After setup, Hermes will appear in the **Preferred conversation agent** selector under **Settings → Voice assistants**.
 
-> **Important:** The Hermes Agent server must handle the `assist_query` and `assist_response` WebSocket message types for the conversation pipeline to work end-to-end. The HA integration forwards queries and awaits responses, but if the Hermes Agent does not recognise these message types, conversation queries time out after 30 seconds. See [Hermes Agent WebSocket message types](#hermes-agent-websocket-message-types) below for the protocol contract.
+> **Important:** The Hermes Agent server must handle the `assist_query` and `assist_response` WebSocket message types for the conversation pipeline to work end-to-end. The HA integration forwards queries and awaits responses, but if the Hermes Agent does not recognise these message types, conversation queries time out after 45 seconds. See [Hermes Agent WebSocket message types](#hermes-agent-websocket-message-types) below for the protocol contract.
 
 5. Submit.
 
@@ -413,13 +413,14 @@ Home Assistant ships a native conversation agent (`conversation.home_assistant`)
 | Mode | Behaviour |
 |---|---|
 | `off` (default) | Every request goes to Hermes. Nothing is answered or executed locally. |
-| `answers` | Hermes asks the native agent first; if HA recognises the sentence as an informational intent (`QUERY_ANSWER`: room temperature, which lights are on, is the window open…), that answer is spoken immediately. Commands are still sent to Hermes. |
+| `answers` | Hermes first uses HA's side-effect-free intent recogniser. Only known read-only query intents (state, temperature, date/time, and timer status) are then processed locally and spoken immediately. Commands are never executed by this mode and are sent to Hermes. |
 | `commands` | As `answers`, plus house commands (`ACTION_DONE`) that HA matches **on the intact transcript** are executed locally instead of going to Hermes. |
 
-Two safety properties are enforced regardless of the mode:
+Three safety properties are enforced regardless of the mode:
 
-- **The transcript sent to Hermes is never rewritten.** The only cleanup performed is dropping whisper.cpp non-speech annotations at the end of the sentence (`[música]`, `(risos)`, `[BLANK_AUDIO]` …) from a *copy* used for the local attempt. Legitimate text such as `send Sam a notification (urgent)` is untouched, and if the local attempt does not match, Hermes receives the original transcript byte for byte.
-- **Truncated sentences can never execute a command.** Cutting "ligar todas as luzes excepto a cozinha. Foi bonito." down to "ligar todas as luzes." changes the meaning, so a shortened candidate is only ever accepted for informational (`QUERY_ANSWER`) results. Commands require the transcript to be intact, and only run in `commands` mode.
+- **Local cleanup never rewrites the Hermes payload.** The only cleanup is dropping known whisper.cpp non-speech annotations at the end of a *copy* used for the local attempt (`[música]`, `(risos)`, `[BLANK_AUDIO]` …). If local handling does not match, Hermes receives the same whitespace-normalised, length-capped text it received before this option existed.
+- **Words and clauses are never guessed away.** The local path does not shorten sentences or remove ordinary trailing words. A multi-clause request therefore stays intact and falls through to Hermes when HA cannot match it as written.
+- **`answers` mode recognises before it executes.** HA's native `async_process` call can run actions before returning `ACTION_DONE`, so the integration first uses the side-effect-free recogniser and permits only a small allow-list of built-in query intent names.
 
 > **Security note (`commands` mode):** requests handled locally never reach Hermes, so they are not filtered by the Hermes Home Assistant plugin's allow-list/block-list and never appear in its audit log. Home Assistant's own boundaries still apply — intents can only reach entities you exposed to Assist. Turn `commands` on only if that trade-off is acceptable; leave it `off` if your allow-list is what keeps unsafe entities out of voice control.
 
@@ -737,7 +738,7 @@ HASS_URL=http://192.168.1.50:8123
 
 ### Assist pipeline times out with "Sorry, I couldn't reach Hermes"
 
-This means the HA integration sent an `assist_query` WebSocket message but never received an `assist_response` within 30 seconds.
+This means the HA integration sent an `assist_query` WebSocket message but never received an `assist_response` within 45 seconds.
 
 **Check:**
 - Confirm the Hermes Agent server recognises the `assist_query` message type. If the WebSocket reader discards unknown types, no response is ever sent.
@@ -785,7 +786,7 @@ Check:
 
 ## Hermes Agent WebSocket message types
 
-The Home Assistant integration communicates with the Hermes Agent server over WebSocket. For the Assist pipeline conversation agent to function, the Hermes Agent server **must** handle these message types. Without them, the pipeline handshake succeeds but all conversation queries time out after 30 seconds.
+The Home Assistant integration communicates with the Hermes Agent server over WebSocket. For the Assist pipeline conversation agent to function, the Hermes Agent server **must** handle these message types. Without them, the pipeline handshake succeeds but all conversation queries time out after 45 seconds.
 
 ### `assist_query` — incoming (Hermes Agent receives)
 
@@ -841,7 +842,7 @@ After processing the query, the Hermes Agent server must send back this response
 4. Hermes Agent sends `assist_response` with the answer.
 5. HA Assist pipeline renders the response in its UI and/or speaks it via TTS.
 
-If no response is received within 30 seconds, the pipeline falls back to an error speech message ("Sorry, I couldn't reach Hermes").
+If no response is received within 45 seconds, the pipeline falls back to an error speech message ("Sorry, I couldn't reach Hermes").
 
 ### Implementation reference
 
@@ -849,7 +850,7 @@ The reader task in `custom_components/hermes/__init__.py` routes incoming messag
 
 ### Known limitations on the Hermes Agent side
 
-- If the Hermes Agent does not recognise the `assist_query` type, the WebSocket reader discards it as unknown and no response is ever sent → 30-second timeout.
+- If the Hermes Agent does not recognise the `assist_query` type, the WebSocket reader discards it as unknown and no response is ever sent → 45-second timeout.
 - If the Hermes Agent sends a response with a mismatched `conversation_id`, the future lookup in the HA integration fails and the response is dropped.
 - The conversation agent expects exactly one `assist_response` per `assist_query`. Sending multiple responses for the same `conversation_id` will deliver only the first one.
 

@@ -37,15 +37,18 @@ def _install_homeassistant_stubs() -> bool:
         return False
 
     modules = {
+        "voluptuous": ModuleType("voluptuous"),
         "homeassistant": ModuleType("homeassistant"),
         "homeassistant.config_entries": ModuleType("homeassistant.config_entries"),
         "homeassistant.const": ModuleType("homeassistant.const"),
         "homeassistant.core": ModuleType("homeassistant.core"),
+        "homeassistant.data_entry_flow": ModuleType("homeassistant.data_entry_flow"),
         "homeassistant.helpers": ModuleType("homeassistant.helpers"),
         "homeassistant.helpers.entity": ModuleType("homeassistant.helpers.entity"),
         "homeassistant.helpers.entity_platform": ModuleType("homeassistant.helpers.entity_platform"),
         "homeassistant.helpers.event": ModuleType("homeassistant.helpers.event"),
         "homeassistant.helpers.intent": ModuleType("homeassistant.helpers.intent"),
+        "homeassistant.helpers.selector": ModuleType("homeassistant.helpers.selector"),
         "homeassistant.helpers.typing": ModuleType("homeassistant.helpers.typing"),
         "homeassistant.components": ModuleType("homeassistant.components"),
         "homeassistant.components.conversation": ModuleType("homeassistant.components.conversation"),
@@ -53,6 +56,14 @@ def _install_homeassistant_stubs() -> bool:
     }
     for name, module in modules.items():
         sys.modules.setdefault(name, module)
+
+    vol = sys.modules["voluptuous"]
+    if not hasattr(vol, "Schema"):
+        setattr(vol, "Schema", lambda value, **kwargs: value)
+        setattr(vol, "Required", lambda key, **kwargs: key)
+        setattr(vol, "Optional", lambda key, **kwargs: key)
+        setattr(vol, "In", lambda values: values)
+        setattr(vol, "Any", lambda *values: values)
 
     const = sys.modules["homeassistant.const"]
     if not hasattr(const, "Platform"):
@@ -68,7 +79,21 @@ def _install_homeassistant_stubs() -> bool:
         core.SupportsResponse = SimpleNamespace(OPTIONAL="optional")
         core.callback = lambda func: func
 
-    sys.modules["homeassistant.config_entries"].ConfigEntry = type("ConfigEntry", (), {})
+    class _FlowBase:
+        def __init_subclass__(cls, **kwargs):
+            return super().__init_subclass__()
+
+        def async_show_form(self, **kwargs):
+            return {"type": "form", **kwargs}
+
+        def async_create_entry(self, **kwargs):
+            return {"type": "create_entry", **kwargs}
+
+    config_entries = sys.modules["homeassistant.config_entries"]
+    setattr(config_entries, "ConfigEntry", type("ConfigEntry", (), {}))
+    setattr(config_entries, "ConfigFlow", type("ConfigFlow", (_FlowBase,), {}))
+    setattr(config_entries, "OptionsFlow", type("OptionsFlow", (_FlowBase,), {}))
+    setattr(sys.modules["homeassistant.data_entry_flow"], "FlowResult", dict)
     sys.modules["homeassistant.helpers.entity"].Entity = object
     sys.modules["homeassistant.helpers.entity_platform"].AddEntitiesCallback = object
     sys.modules["homeassistant.helpers.event"].async_track_state_change_event = (
@@ -76,6 +101,16 @@ def _install_homeassistant_stubs() -> bool:
     )
     sys.modules["homeassistant.helpers.typing"].ConfigType = dict
     sys.modules["homeassistant.components.http"].StaticPathConfig = lambda *a, **k: (a, k)
+
+    selector_mod = sys.modules["homeassistant.helpers.selector"]
+    setattr(selector_mod, "TextSelector", lambda *a, **k: (a, k))
+    setattr(selector_mod, "TextSelectorConfig", lambda *a, **k: (a, k))
+    setattr(
+        selector_mod,
+        "TextSelectorType",
+        SimpleNamespace(URL="url", PASSWORD="password"),
+    )
+    setattr(sys.modules["homeassistant.helpers"], "selector", selector_mod)
 
     # --- intent -----------------------------------------------------------
     intent_mod = sys.modules["homeassistant.helpers.intent"]
@@ -144,6 +179,7 @@ HA_STUBBED = _install_homeassistant_stubs()
 
 from custom_components.hermes import QUERY_TIMEOUT_SECONDS
 from custom_components.hermes import conversation as agent_module
+from custom_components.hermes import config_flow as config_flow_module
 from custom_components.hermes.const import (
     CONF_LOCAL_INTENTS,
     DOMAIN,
@@ -186,12 +222,28 @@ class FakeLocalAgent:
     def __init__(self, answers: dict[str, tuple[str, str]]) -> None:
         self.answers = answers
         self.calls: list[str] = []
+        self.recognitions: list[str] = []
+        self.executions: list[str] = []
+
+    async def async_recognize_intent(self, user_input):
+        """Recognise without executing, like HA's DefaultAgent."""
+        self.recognitions.append(user_input.text)
+        answer = self.answers.get(user_input.text)
+        if answer is None:
+            return None
+        kind, _speech = answer
+        intent_name = "HassGetState" if kind == ANSWER else "HassTurnOn"
+        return SimpleNamespace(
+            intent=SimpleNamespace(name=intent_name), unmatched_entities=[]
+        )
 
     async def async_process(self, user_input):
         self.calls.append(user_input.text)
         if user_input.text not in self.answers:
             return _local_result(ANSWER, "")
         kind, speech = self.answers[user_input.text]
+        if kind == ACTION:
+            self.executions.append(user_input.text)
         return _local_result(kind, speech)
 
 
@@ -272,21 +324,26 @@ def test_cleanup_never_returns_empty_text() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Candidates: truncation is only ever allowed to answer queries
+# Local candidate: marker cleanup only, never semantic truncation
 # ---------------------------------------------------------------------------
-def test_candidates_mark_truncations_as_action_forbidden() -> None:
-    candidatos = agent_module._local_candidates(
-        "desligar a luz pequena. foi bonito."
+def test_local_candidate_never_truncates_words_or_clauses() -> None:
+    assert (
+        agent_module._local_candidate(
+            "que luzes estão ligadas? e quais janelas estão abertas?"
+        )
+        == "que luzes estão ligadas? e quais janelas estão abertas?"
     )
-    assert ("desligar a luz pequena. foi bonito.", True) in candidatos
-    assert ("desligar a luz pequena.", False) in candidatos
-    assert all(pode_agir for texto, pode_agir in candidatos if texto.endswith("bonito."))
+    assert (
+        agent_module._local_candidate("desligar a luz pequena. foi bonito.")
+        == "desligar a luz pequena. foi bonito."
+    )
 
 
 def test_marker_stripped_candidate_may_still_act() -> None:
-    candidatos = agent_module._local_candidates("ligar a luz pequena [música]")
-    assert candidatos[0] == ("ligar a luz pequena [música]", True)
-    assert ("ligar a luz pequena", True) in candidatos
+    assert (
+        agent_module._local_candidate("ligar a luz pequena [música]")
+        == "ligar a luz pequena"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -324,6 +381,28 @@ async def test_setup_entry_reads_mode_from_entry_options() -> None:
     assert created[0]._bridge is bridge
 
 
+@needs_stubs
+async def test_options_flow_persists_local_intents_mode() -> None:
+    """Exercise the real options-flow code instead of inspecting its source."""
+    entry = SimpleNamespace(options={})
+    flow = config_flow_module.HermesOptionsFlow(entry)
+
+    result = await flow.async_step_init(
+        {
+            "entity_filter": "light.kitchen",
+            "verify_ssl": True,
+            CONF_LOCAL_INTENTS: LOCAL_INTENTS_ANSWERS,
+        }
+    )
+    assert result["type"] == "form"
+
+    result = await flow.async_step_voice({})
+    assert result["type"] == "create_entry"
+    assert result["data"][CONF_LOCAL_INTENTS] == LOCAL_INTENTS_ANSWERS
+    assert config_flow_module._default_options()[CONF_LOCAL_INTENTS] == LOCAL_INTENTS_OFF
+    assert config_flow_module._parse_local_intents("unknown") == LOCAL_INTENTS_OFF
+
+
 # ---------------------------------------------------------------------------
 # The transcript sent to Hermes is always the original one
 # ---------------------------------------------------------------------------
@@ -342,12 +421,15 @@ async def test_hermes_receives_the_original_transcript() -> None:
 
 @needs_stubs
 async def test_hermes_payload_is_truncated_at_max_length() -> None:
-    agent, bridge = _make_agent(LOCAL_INTENTS_OFF)
+    agent, bridge = _make_agent(LOCAL_INTENTS_COMMANDS)
     long_text = "a" * (MAX_QUERY_TEXT_LENGTH + 10)
+    local = _use_local_agent({long_text[:MAX_QUERY_TEXT_LENGTH]: (ACTION, "Ligado")})
 
     await agent.async_process(_input(long_text))
 
     assert bridge.texts == [long_text[:MAX_QUERY_TEXT_LENGTH]]
+    assert local.calls == []
+    assert local.executions == []
 
 
 # ---------------------------------------------------------------------------
@@ -365,14 +447,15 @@ async def test_query_answer_is_returned_locally() -> None:
 
 
 @needs_stubs
-async def test_truncated_candidate_can_still_answer_a_query() -> None:
+async def test_multi_clause_query_is_not_truncated() -> None:
     agent, bridge = _make_agent(LOCAL_INTENTS_ANSWERS)
     _use_local_agent({"que luzes estão ligadas?": (ANSWER, "Três luzes")})
 
-    result = await agent.async_process(_input("que luzes estão ligadas? foi bonito."))
+    text = "que luzes estão ligadas? e quais janelas estão abertas?"
+    result = await agent.async_process(_input(text))
 
-    assert _speech(result) == "Três luzes"
-    assert bridge.texts == []
+    assert _speech(result) == "resposta do Hermes"
+    assert bridge.texts == [text]
 
 
 @needs_stubs
@@ -407,7 +490,9 @@ async def test_answers_mode_never_executes_commands_locally() -> None:
 
     result = await agent.async_process(_input("ligar a luz pequena [música]"))
 
-    assert local.calls, "the local agent may be asked, but must not execute"
+    assert local.recognitions == ["ligar a luz pequena"]
+    assert local.calls == []
+    assert local.executions == []
     assert bridge.texts == ["ligar a luz pequena [música]"]
     assert _speech(result) == "resposta do Hermes"
 
@@ -415,23 +500,26 @@ async def test_answers_mode_never_executes_commands_locally() -> None:
 @needs_stubs
 async def test_commands_mode_executes_an_intact_command_locally() -> None:
     agent, bridge = _make_agent(LOCAL_INTENTS_COMMANDS)
-    _use_local_agent({"ligar a luz pequena": (ACTION, "Ligado")})
+    local = _use_local_agent({"ligar a luz pequena": (ACTION, "Ligado")})
 
     result = await agent.async_process(_input("ligar a luz pequena [música]"))
 
     assert _speech(result) == "Ligado"
     assert bridge.texts == []
+    assert local.executions == ["ligar a luz pequena"]
 
 
 @needs_stubs
-async def test_truncated_candidate_never_executes_a_command() -> None:
+async def test_multi_clause_request_is_never_truncated_or_executed() -> None:
     agent, bridge = _make_agent(LOCAL_INTENTS_COMMANDS)
     local = _use_local_agent({"desligar a luz pequena.": (ACTION, "Desligado")})
 
-    result = await agent.async_process(_input("desligar a luz pequena. foi bonito."))
+    text = "desligar a luz pequena. afinal, não desligues."
+    result = await agent.async_process(_input(text))
 
-    assert "desligar a luz pequena." in local.calls
-    assert bridge.texts == ["desligar a luz pequena. foi bonito."]
+    assert local.calls == [text]
+    assert local.executions == []
+    assert bridge.texts == [text]
     assert _speech(result) == "resposta do Hermes"
 
 
@@ -440,10 +528,13 @@ async def test_except_clause_is_sent_to_hermes_untouched() -> None:
     """'turn off all lights except the kitchen' must never be shortened."""
     text = "ligar todas as luzes excepto a cozinha. foi bonito."
     agent, bridge = _make_agent(LOCAL_INTENTS_COMMANDS)
-    _use_local_agent({"ligar todas as luzes excepto a cozinha.": (ACTION, "Ligado")})
+    local = _use_local_agent(
+        {"ligar todas as luzes excepto a cozinha.": (ACTION, "Ligado")}
+    )
 
     result = await agent.async_process(_input(text))
 
+    assert local.executions == []
     assert bridge.texts == [text]
     assert _speech(result) == "resposta do Hermes"
 

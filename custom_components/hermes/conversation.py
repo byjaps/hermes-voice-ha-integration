@@ -33,6 +33,7 @@ from .const import (
     CONF_LOCAL_INTENTS,
     DEFAULT_LOCAL_INTENTS,
     DOMAIN,
+    LOCAL_INTENTS_ANSWERS,
     LOCAL_INTENTS_COMMANDS,
     LOCAL_INTENTS_OFF,
     LOCAL_INTENTS_OPTIONS,
@@ -95,6 +96,20 @@ _NON_SPEECH_MARKERS = frozenset(
 )
 _MARKER_TAIL = re.compile(r"\s*[\[(]([^\])]*)[\])][\s.,;:!?]*$")
 
+# Home Assistant's native agent executes a matched intent inside
+# ``async_process``. In answers-only mode, recognise first and only execute
+# built-in query intents whose handlers are read-only. This prevents a command
+# from running locally before its ACTION_DONE response can be inspected.
+_SAFE_LOCAL_QUERY_INTENTS = frozenset(
+    {
+        "HassClimateGetTemperature",
+        "HassGetCurrentDate",
+        "HassGetCurrentTime",
+        "HassGetState",
+        "HassTimerStatus",
+    }
+)
+
 
 def _is_non_speech_marker(inner: str) -> bool:
     """True quando o conteúdo entre parênteses é um marcador de não-fala."""
@@ -119,50 +134,14 @@ def _strip_non_speech_markers(text: str) -> str:
     return out or text
 
 
-def _truncated_candidates(text: str) -> list[str]:
-    """Cortes da transcrição, do mais longo para o mais curto.
+def _local_candidate(text: str) -> str:
+    """Return the sole safe candidate for native Home Assistant handling.
 
-    O Whisper também cola FRASES inteiras ("Desligar a luz pequena. Foi
-    bonito."), impossíveis de prever numa lista. Estes cortes servem só para
-    consultas: ver `_local_candidates`.
+    Only evidence-backed non-speech markers are removed. Arbitrary sentence or
+    word truncation is never attempted because even an informational request
+    can change meaning when a clause is dropped.
     """
-    candidatos: list[str] = []
-    partes = re.split(r"(?<=[.!?;])\s+", text)
-    for n in range(len(partes) - 1, 0, -1):
-        candidato = " ".join(partes[:n]).strip()
-        if candidato:
-            candidatos.append(candidato)
-    palavras = text.split()
-    for n in (1, 2):
-        if len(palavras) - n >= 2:
-            candidatos.append(" ".join(palavras[:-n]).rstrip(" ,;:"))
-    return [c for c in candidatos if c and c != text]
-
-
-def _local_candidates(text: str) -> list[tuple[str, bool]]:
-    """Candidatos a testar no agente nativo: `(texto, pode_executar_ação)`.
-
-    `pode_executar_ação` é True apenas para a transcrição verbatim e para a
-    mesma transcrição sem um marcador de não-fala — nesses casos o pedido do
-    utilizador está intacto. Cortes arbitrários NUNCA podem aceitar
-    `ACTION_DONE`: encurtar um comando muda-lhe o sentido ("ligar as luzes
-    excepto a cozinha" → "ligar as luzes"). Em consultas (`QUERY_ANSWER`) um
-    corte é inofensivo, porque não tem efeitos secundários.
-    """
-    candidatos: list[tuple[str, bool]] = [(text, True)]
-    limpo = _strip_non_speech_markers(text)
-    if limpo != text:
-        candidatos.append((limpo, True))
-    base = limpo or text
-    candidatos.extend((c, False) for c in _truncated_candidates(base))
-
-    vistos: set[str] = set()
-    saida: list[tuple[str, bool]] = []
-    for candidato, pode_agir in candidatos:
-        if candidato and candidato not in vistos:
-            vistos.add(candidato)
-            saida.append((candidato, pode_agir))
-    return saida
+    return _strip_non_speech_markers(text)
 
 
 def _resposta_texto(result: ConversationResult) -> str:
@@ -277,34 +256,35 @@ class HermesConversationAgent(ConversationEntity):
         """Tentar resolver o pedido com o agente NATIVO do HA.
 
         Devolve None quando o pedido não é resolvido localmente, para o Hermes
-        tratar dele. Consultas (`QUERY_ANSWER`) podem ser respondidas a partir
-        de qualquer candidato; comandos (`ACTION_DONE`) só a partir da
-        transcrição intacta (verbatim ou sem um marcador de não-fala) e apenas
-        no modo "commands".
+        tratar dele. Em modo "answers", o agente nativo reconhece primeiro o
+        intent sem o executar; apenas intents de consulta conhecidos são então
+        processados. Em modo "commands", o utilizador optou explicitamente por
+        permitir a execução local de comandos.
         """
         modo = self.local_intents
         if modo == LOCAL_INTENTS_OFF or not text:
             return None
 
-        for candidato, pode_agir in _local_candidates(text):
-            resultado = await self._tenta_local(user_input, candidato)
-            if resultado is None:
-                continue
-            tipo = _tipo_resposta_local(resultado)
-            if tipo == "answer":
-                _LOGGER.info("Consulta respondida localmente pelo HA: %r", candidato)
-                return resultado
-            if tipo == "action" and pode_agir and modo == LOCAL_INTENTS_COMMANDS:
-                _LOGGER.warning(
-                    "Comando de casa executado localmente pelo HA, sem passar "
-                    "pelo Hermes: %r",
-                    candidato,
-                )
-                return resultado
+        candidato = _local_candidate(text)
+        resultado = await self._tenta_local(user_input, candidato, modo)
+        if resultado is None:
+            return None
+
+        tipo = _tipo_resposta_local(resultado)
+        if tipo == "answer":
+            _LOGGER.info("Consulta respondida localmente pelo HA: %r", candidato)
+            return resultado
+        if tipo == "action" and modo == LOCAL_INTENTS_COMMANDS:
+            _LOGGER.warning(
+                "Comando de casa executado localmente pelo HA, sem passar "
+                "pelo Hermes: %r",
+                candidato,
+            )
+            return resultado
         return None
 
     async def _tenta_local(
-        self, user_input: ConversationInput, text: str
+        self, user_input: ConversationInput, text: str, modo: str
     ) -> ConversationResult | None:
         """Tenta UM candidato no agente nativo do HA; None se não resolver."""
         try:
@@ -316,6 +296,25 @@ class HermesConversationAgent(ConversationEntity):
             local_input = dataclasses.replace(
                 user_input, text=text, agent_id=LOCAL_AGENT_ID
             )
+
+            if modo == LOCAL_INTENTS_ANSWERS:
+                # ``async_process`` runs the intent before returning its result,
+                # so classifying ACTION_DONE afterwards is too late. The native
+                # DefaultAgent exposes a side-effect-free recogniser in current
+                # Home Assistant. If unavailable, fail closed to Hermes.
+                reconhecer = getattr(agent, "async_recognize_intent", None)
+                if reconhecer is None:
+                    return None
+                reconhecimento = await reconhecer(local_input)
+                intent_name = getattr(
+                    getattr(reconhecimento, "intent", None), "name", None
+                )
+                if (
+                    intent_name not in _SAFE_LOCAL_QUERY_INTENTS
+                    or getattr(reconhecimento, "unmatched_entities", ())
+                ):
+                    return None
+
             result = await agent.async_process(local_input)
         except Exception as exc:  # noqa: BLE001 - nunca bloquear o Hermes
             _LOGGER.debug("Agente nativo do HA indisponível: %s", exc)
@@ -331,10 +330,10 @@ class HermesConversationAgent(ConversationEntity):
         Forwards the user text to Hermes over the WebSocket bridge
         and returns the agent's response.
         """
-        original_text = (user_input.text or "").strip()
-        # O texto entregue ao Hermes é sempre o original: a limpeza de
-        # marcadores de não-fala serve apenas para o teste local.
-        text = original_text
+        # Preserve the integration's established whitespace normalisation and
+        # maximum WebSocket payload, while ensuring local cleanup never changes
+        # what is sent to Hermes.
+        text = (user_input.text or "").strip()
         language = getattr(user_input, "language", None) or "en"
 
         if not text:
@@ -346,7 +345,8 @@ class HermesConversationAgent(ConversationEntity):
 
         # Enforce a reasonable maximum input length to prevent oversized
         # WebSocket frames and memory pressure from developer-tool bypasses.
-        if len(text) > MAX_QUERY_TEXT_LENGTH:
+        allow_local = len(text) <= MAX_QUERY_TEXT_LENGTH
+        if not allow_local:
             _LOGGER.warning(
                 "Truncating conversation query from %d to %d chars",
                 len(text),
@@ -359,9 +359,10 @@ class HermesConversationAgent(ConversationEntity):
         # Pedido de casa? Com o modo local ligado, o HA resolve-o em
         # milissegundos em vez de gastar uma volta completa do Hermes
         # (10-30 s).
-        local_result = await self._try_local_agent(user_input, text)
-        if local_result is not None:
-            return local_result
+        if allow_local:
+            local_result = await self._try_local_agent(user_input, text)
+            if local_result is not None:
+                return local_result
 
         try:
             result = await self._bridge.async_send_conversation_query(
