@@ -2,6 +2,12 @@
 
 All notable changes to the hermes-voice-ha-integration project.
 
+## [Unreleased]
+
+### Fixed
+- The bundled Hermes `voice_stack` plugin no longer warns `address already in use` on port 7860 when a second Hermes process loads it. The receiver is a process-wide singleton but the plugin is re-imported with fresh module globals by every Hermes process that loads it (gateway, CLI session, dashboard), so each one re-attempted the bind and logged a failure for a port the first process was already serving. `start_ws_receiver` now probes the port first and logs an informational "already served by another Hermes process" instead, while a genuinely foreign service on that port still warns.
+- `HermesHAWebSocketServer.running` no longer reports `True` after a failed bind. It was judged on the startup event, which is set for both outcomes (the caller must not wait forever), so during a failed bind — while the thread was still inside its cleanup — the property reported a live receiver and `start_ws_receiver` handed back a dead server. Liveness now requires a dedicated "bound and serving" event.
+
 ## [0.0.14] — 2026-09-21
 
 ### Added

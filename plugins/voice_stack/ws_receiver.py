@@ -9,11 +9,14 @@ control actions to the local voice stack tools.
 from __future__ import annotations
 
 import asyncio
+import errno
 import hmac
 import inspect
 import json
 import logging
 import os
+import socket
+import sys
 import threading
 import time
 from collections.abc import Awaitable
@@ -35,6 +38,13 @@ logger = logging.getLogger(__name__)
 DEFAULT_WS_HOST = "0.0.0.0"
 DEFAULT_WS_PORT = 7860
 DEFAULT_WS_PATH = "/api/hermes/ws"
+
+# The receiver is a process-wide singleton, but Hermes re-imports plugin modules
+# freely (a fresh import resets the module globals below), so the in-process
+# marker lives on `sys` — which survives re-imports — and the port itself is
+# probed before binding.
+_PROC_SINGLETON_ATTR = "_hermes_voice_stack_ws_receiver"
+_BIND_PROBE_TIMEOUT = 1.5
 
 _WS_SERVER: Optional["HermesHAWebSocketServer"] = None
 _WS_LOCK = threading.Lock()
@@ -313,6 +323,7 @@ class HermesHAWebSocketServer:
         self._thread: Optional[threading.Thread] = None
         self._runner: Optional["aiohttp_web.AppRunner"] = None
         self._started = threading.Event()
+        self._ready = threading.Event()
         self._stopped = threading.Event()
         self._active_connections = 0
         self._total_connections = 0
@@ -339,7 +350,13 @@ class HermesHAWebSocketServer:
 
     @property
     def running(self) -> bool:
-        return self._thread is not None and self._thread.is_alive() and self._started.is_set()
+        """True only when the socket is actually bound and serving.
+
+        ``_started`` is set for both outcomes (the caller must not wait forever),
+        so a failed bind — thread still alive inside its cleanup — would otherwise
+        report ``running=True`` and hand back a dead server.
+        """
+        return self._ready.is_set() and self._thread is not None and self._thread.is_alive()
 
     def start(self) -> bool:
         """Start the receiver in a daemon thread. Returns False if already running."""
@@ -369,11 +386,20 @@ class HermesHAWebSocketServer:
         asyncio.set_event_loop(loop)
         try:
             loop.run_until_complete(self._start_async())
+            self._ready.set()
             self._started.set()
             logger.info("Hermes HA WebSocket receiver listening on %s:%s%s", self.host, self.port, self.path)
             loop.run_forever()
         except Exception as exc:
-            logger.warning("Hermes HA WebSocket receiver failed to start: %s", exc)
+            if _is_port_conflict(exc) and _probe_receiver(self.host, self.port, self.path):
+                logger.info(
+                    "Hermes HA WebSocket receiver already served on %s:%s%s by another Hermes process — not binding again",
+                    self.host,
+                    self.port,
+                    self.path,
+                )
+            else:
+                logger.warning("Hermes HA WebSocket receiver failed to start: %s", exc)
             self._started.set()
         finally:
             try:
@@ -395,6 +421,7 @@ class HermesHAWebSocketServer:
         self._runner = runner
 
     async def _shutdown(self) -> None:
+        self._ready.clear()
         runner = self._runner
         self._runner = None
         if runner is not None:
@@ -436,6 +463,59 @@ class HermesHAWebSocketServer:
         return ws
 
 
+def _is_port_conflict(exc: BaseException) -> bool:
+    """True when the exception is an 'address already in use' bind failure."""
+    if getattr(exc, "errno", None) == errno.EADDRINUSE:
+        return True
+    return "address already in use" in str(exc).lower()
+
+
+def _probe_receiver(host: str, port: int, path: str, timeout: float = _BIND_PROBE_TIMEOUT) -> bool:
+    """True when something that answers like this receiver already listens there.
+
+    Any Hermes process can load the plugin (gateway, CLI session, dashboard) and
+    each of them re-imports the module with fresh globals, so several processes
+    legitimately try the same port. A plain GET on the WebSocket path is answered
+    by this receiver — 401 when the bearer token is required, 400/426 when the
+    request is not a WebSocket upgrade — while a foreign service on that port
+    (e.g. the dashboard's 404) does not match, so a genuine conflict still warns.
+    """
+    probe_host = "127.0.0.1" if host in {"", "0.0.0.0", "::"} else host
+    request = (
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: {probe_host}:{port}\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode("ascii", "ignore")
+    try:
+        with socket.create_connection((probe_host, port), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            sock.sendall(request)
+            status_line = sock.recv(64).split(b"\r\n", 1)[0]
+    except OSError:
+        return False
+    parts = status_line.split()
+    if len(parts) < 2 or not parts[0].startswith(b"HTTP/"):
+        return False
+    try:
+        code = int(parts[1])
+    except ValueError:
+        return False
+    return code in {400, 401, 426}
+
+
+def _process_receiver() -> Optional["HermesHAWebSocketServer"]:
+    """Return the receiver already started in THIS process (survives re-imports).
+
+    Duck-typed on purpose: Hermes re-imports the module, so the instance found on
+    ``sys`` belongs to a *different* module object than this one and a class
+    identity check would reject a perfectly live receiver.
+    """
+    server = getattr(sys, _PROC_SINGLETON_ATTR, None)
+    if server is not None and getattr(server, "running", False):
+        return server
+    return None
+
+
 def start_ws_receiver(host: Optional[str] = None, port: Optional[int] = None, path: Optional[str] = None) -> Optional[HermesHAWebSocketServer]:
     """Start the singleton HA WebSocket receiver if enabled."""
     if os.getenv("HERMES_HA_WS_ENABLED", "1").strip().lower() in {"0", "false", "no", "off"}:
@@ -453,9 +533,24 @@ def start_ws_receiver(host: Optional[str] = None, port: Optional[int] = None, pa
     with _WS_LOCK:
         if _WS_SERVER and _WS_SERVER.running:
             return _WS_SERVER
+        in_process = _process_receiver()
+        if in_process is not None:
+            _WS_SERVER = in_process
+            return in_process
+        if _probe_receiver(resolved_host, resolved_port, resolved_path):
+            logger.info(
+                "Hermes HA WebSocket receiver already served on %s:%s%s by another Hermes process — not binding again",
+                resolved_host,
+                resolved_port,
+                resolved_path,
+            )
+            return None
         _WS_SERVER = HermesHAWebSocketServer(resolved_host, resolved_port, resolved_path)
         _WS_SERVER.start()
-        return _WS_SERVER if _WS_SERVER.running else None
+        if _WS_SERVER.running:
+            setattr(sys, _PROC_SINGLETON_ATTR, _WS_SERVER)
+            return _WS_SERVER
+        return None
 
 
 def stop_ws_receiver() -> None:
@@ -464,5 +559,10 @@ def stop_ws_receiver() -> None:
     with _WS_LOCK:
         server = _WS_SERVER
         _WS_SERVER = None
+    if server is not None and getattr(sys, _PROC_SINGLETON_ATTR, None) is server:
+        try:
+            delattr(sys, _PROC_SINGLETON_ATTR)
+        except AttributeError:  # pragma: no cover - defensive
+            pass
     if server is not None:
         server.stop()
