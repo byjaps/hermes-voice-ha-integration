@@ -16,17 +16,22 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import io
 import json
 import logging
+import multiprocessing
+import os
 import socket
 import sys
 import threading
+import time
+import types
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
 import pytest
-from aiohttp import ClientSession
+from aiohttp import ClientSession, WSServerHandshakeError
 
 from plugins.voice_stack import ws_receiver
 
@@ -109,13 +114,15 @@ class _FakeService:
         self._thread.join(timeout=5)
 
 
-def _identity_responder(path: str = WS_PATH) -> Callable[[str], tuple[int, Optional[dict[str, Any]]]]:
+def _identity_responder(
+    path: str = WS_PATH, *, include_profile: bool = True
+) -> Callable[[str], tuple[int, Optional[dict[str, Any]]]]:
     """Answers like this receiver's /health route."""
 
     def responder(target: str) -> tuple[int, Optional[dict[str, Any]]]:
         if target.split("?")[0] != ws_receiver.DEFAULT_HEALTH_PATH:
             return 404, None
-        return 200, {
+        payload = {
             "type": "status",
             "service": ws_receiver.SERVICE_ID,
             "running": True,
@@ -123,6 +130,9 @@ def _identity_responder(path: str = WS_PATH) -> Callable[[str], tuple[int, Optio
             "port": 0,
             "path": path,
         }
+        if include_profile:
+            payload["profile_id"] = ws_receiver._profile_identity()
+        return 200, payload
 
     return responder
 
@@ -165,9 +175,10 @@ def _clean_receiver() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
-def _isolated_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def _isolated_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """No ambient receiver config leaks into a test's expectations."""
     monkeypatch.setenv("HERMES_HA_WS_ENABLED", "1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
     monkeypatch.delenv("HERMES_HA_WS_TOKEN", raising=False)
 
 
@@ -195,6 +206,37 @@ async def _assist_response_text(port: int, path: str) -> str:
             )
             response = await ws.receive_json()
             return str(response["text"])
+
+
+def _receiver_process(
+    profile_home: str,
+    port: int,
+    hold_open: bool,
+    stop_event: Any,
+    result_queue: Any,
+) -> None:
+    """Run one independently scoped receiver process for ownership tests."""
+    os.environ["HERMES_HOME"] = profile_home
+    os.environ["HERMES_HA_WS_ENABLED"] = "1"
+    os.environ.pop("HERMES_HA_WS_TOKEN", None)
+    module = _load_module(f"ws_receiver_process_{os.getpid()}")
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    module.logger.addHandler(handler)
+    module.logger.setLevel(logging.INFO)
+    try:
+        server = module.start_ws_receiver(
+            host="127.0.0.1", port=port, path=WS_PATH
+        )
+        result_queue.put(
+            {"started": server is not None and server.running, "log": stream.getvalue()}
+        )
+        if server is not None and hold_open:
+            stop_event.wait(10)
+        if server is not None:
+            server.stop()
+    finally:
+        module.logger.removeHandler(handler)
 
 
 # --------------------------------------------------------------------------- #
@@ -265,6 +307,85 @@ def test_is_port_conflict_matches_both_errno_and_message() -> None:
     assert not ws_receiver._is_port_conflict(OSError(99, "Cannot assign requested address"))
 
 
+@requires_aiohttp
+def test_profile_scope_overrides_launch_receiver_config_and_token(
+    free_port: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A routed profile must not read receiver settings or auth from os.environ."""
+    module = _load_module("ws_receiver_scoped_config")
+    scoped_values = {
+        "HERMES_HA_WS_ENABLED": "1",
+        "HERMES_HA_WS_HOST": "127.0.0.1",
+        "HERMES_HA_WS_PORT": str(free_port),
+        "HERMES_HA_WS_PATH": WS_PATH,
+        "HERMES_HA_WS_TOKEN": "owner-profile-token",
+    }
+    real_import_module = module.importlib.import_module
+
+    def scoped_import(name: str, *args: Any, **kwargs: Any):
+        if name == "agent.secret_scope":
+            return types.SimpleNamespace(
+                get_secret=lambda key, default=None: scoped_values.get(key, default)
+            )
+        return real_import_module(name, *args, **kwargs)
+
+    monkeypatch.setattr(module.importlib, "import_module", scoped_import)
+    monkeypatch.setenv("HERMES_HA_WS_ENABLED", "0")
+    monkeypatch.setenv("HERMES_HA_WS_PORT", str(free_port + 1))
+    monkeypatch.setenv("HERMES_HA_WS_TOKEN", "launch-profile-token")
+
+    server = module.start_ws_receiver()
+    assert server is not None and server.running
+    assert (server.host, server.port, server.path) == (
+        "127.0.0.1",
+        free_port,
+        WS_PATH,
+    )
+
+    async def handshake_status(token: str) -> int:
+        headers = {"Authorization": f"Bearer {token}"}
+        async with ClientSession() as session:
+            try:
+                async with session.ws_connect(
+                    f"http://127.0.0.1:{free_port}{WS_PATH}", headers=headers
+                ) as client:
+                    await client.receive_json()
+                    return 101
+            except WSServerHandshakeError as exc:
+                return exc.status
+
+    try:
+        assert asyncio.run(handshake_status("owner-profile-token")) == 101
+        assert asyncio.run(handshake_status("launch-profile-token")) == 401
+    finally:
+        server.stop()
+
+
+def test_profile_scope_failure_does_not_fall_back_to_launch_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fail-closed Hermes resolver error must not expose os.environ credentials."""
+    module = _load_module("ws_receiver_scoped_failure")
+    real_import_module = module.importlib.import_module
+
+    class ScopeError(RuntimeError):
+        pass
+
+    def get_secret(_name: str, _default: Optional[str] = None) -> Optional[str]:
+        raise ScopeError("missing profile scope")
+
+    def failing_import(name: str, *args: Any, **kwargs: Any):
+        if name == "agent.secret_scope":
+            return types.SimpleNamespace(get_secret=get_secret)
+        return real_import_module(name, *args, **kwargs)
+
+    monkeypatch.setattr(module.importlib, "import_module", failing_import)
+    monkeypatch.setenv("HERMES_HA_WS_TOKEN", "launch-profile-token")
+
+    with pytest.raises(ScopeError, match="missing profile scope"):
+        module._configured_token()
+
+
 # --------------------------------------------------------------------------- #
 # Liveness                                                                    #
 # --------------------------------------------------------------------------- #
@@ -284,6 +405,44 @@ def test_running_requires_a_completed_bind() -> None:
     assert not server.running
     server._ready.set()  # bound... but there is no live thread either
     assert not server.running
+
+
+@requires_aiohttp
+def test_stop_closes_an_active_client_and_terminates_the_thread(
+    free_port: int,
+) -> None:
+    """Unload must not orphan Home Assistant's long-lived connection."""
+    module = _load_module("ws_receiver_active_unload")
+    server = module.start_ws_receiver(
+        host="127.0.0.1", port=free_port, path=WS_PATH
+    )
+    assert server is not None and server.running
+
+    async def stop_while_connected():
+        async with ClientSession() as session:
+            ws = await session.ws_connect(
+                f"http://127.0.0.1:{free_port}{WS_PATH}"
+            )
+            await ws.receive_json()
+            assert server.active_connections == 1
+            started = time.monotonic()
+            await asyncio.to_thread(module.stop_ws_receiver)
+            elapsed = time.monotonic() - started
+            close_message = await asyncio.wait_for(ws.receive(), timeout=2)
+            await ws.close()
+            return elapsed, close_message.type, ws.closed
+
+    elapsed, close_type, client_closed = asyncio.run(stop_while_connected())
+
+    assert elapsed < 2
+    assert close_type in {
+        ws_receiver.WSMsgType.CLOSE,
+        ws_receiver.WSMsgType.CLOSED,
+        ws_receiver.WSMsgType.CLOSING,
+    }
+    assert client_closed
+    assert not server.running
+    assert server._thread is not None and not server._thread.is_alive()
 
 
 # --------------------------------------------------------------------------- #
@@ -323,16 +482,38 @@ def test_reload_rebinds_and_uses_the_new_assist_handler(
     try:
         second_module = _load_module("ws_receiver_stale_second")
         second_module.set_assist_query_handler(lambda _payload: {"text": "new context"})
+
+        async def reload_with_open_connection():
+            async with ClientSession() as session:
+                old_ws = await session.ws_connect(
+                    f"http://127.0.0.1:{free_port}{WS_PATH}"
+                )
+                await old_ws.receive_json()  # hello from the old module
+                replacement = await asyncio.to_thread(
+                    second_module.start_ws_receiver,
+                    "127.0.0.1",
+                    free_port,
+                    WS_PATH,
+                )
+                close_message = await asyncio.wait_for(old_ws.receive(), timeout=2)
+                assert close_message.type in {
+                    ws_receiver.WSMsgType.CLOSE,
+                    ws_receiver.WSMsgType.CLOSED,
+                    ws_receiver.WSMsgType.CLOSING,
+                }
+                await old_ws.close()
+            text = await _assist_response_text(free_port, WS_PATH)
+            return replacement, text
+
         with caplog.at_level(logging.INFO, logger=second_module.__name__):
-            second = second_module.start_ws_receiver(
-                host="127.0.0.1", port=free_port, path=WS_PATH
-            )
+            second, response_text = asyncio.run(reload_with_open_connection())
 
         assert second is not None and second is not first
         assert second.running
         assert not first.running
+        assert first._thread is not None and not first._thread.is_alive()
         assert "rebinding" in caplog.text
-        assert asyncio.run(_assist_response_text(free_port, WS_PATH)) == "new context"
+        assert response_text == "new context"
     finally:
         first.stop()
         if second is not None:
@@ -422,6 +603,56 @@ def test_start_is_quiet_when_another_process_serves_the_port(
 
 
 @requires_aiohttp
+def test_cross_process_probe_distinguishes_same_and_other_profiles(
+    tmp_path: Path, free_port: int
+) -> None:
+    """Only another process for the same profile is a harmless duplicate."""
+    process_context = multiprocessing.get_context("spawn")
+    stop_event = process_context.Event()
+    results = process_context.Queue()
+    profile_a = str(tmp_path / "profiles" / "a")
+    profile_b = str(tmp_path / "profiles" / "b")
+    owner = process_context.Process(
+        target=_receiver_process,
+        args=(profile_a, free_port, True, stop_event, results),
+    )
+    owner.start()
+    try:
+        owner_result = results.get(timeout=10)
+        assert owner_result["started"] is True
+
+        same_profile = process_context.Process(
+            target=_receiver_process,
+            args=(profile_a, free_port, False, stop_event, results),
+        )
+        same_profile.start()
+        same_result = results.get(timeout=10)
+        same_profile.join(timeout=10)
+        assert same_profile.exitcode == 0
+        assert same_result["started"] is False
+        assert "another process for this profile" in same_result["log"]
+
+        other_profile = process_context.Process(
+            target=_receiver_process,
+            args=(profile_b, free_port, False, stop_event, results),
+        )
+        other_profile.start()
+        other_result = results.get(timeout=10)
+        other_profile.join(timeout=10)
+        assert other_profile.exitcode == 0
+        assert other_result["started"] is False
+        assert "different or unidentified profile" in other_result["log"]
+        assert "configure a different HERMES_HA_WS_PORT" in other_result["log"]
+    finally:
+        stop_event.set()
+        owner.join(timeout=10)
+        if owner.is_alive():  # pragma: no cover - defensive child cleanup
+            owner.terminate()
+            owner.join(timeout=5)
+    assert owner.exitcode == 0
+
+
+@requires_aiohttp
 def test_start_warns_when_a_foreign_service_holds_the_port(
     free_port: int, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -454,6 +685,24 @@ def test_start_warns_when_a_hermes_receiver_serves_another_path(
 
     assert started is None
     assert "instead of" in caplog.text
+
+
+@requires_aiohttp
+def test_start_warns_when_receiver_health_has_no_profile_identity(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An older or unidentified receiver must not suppress a profile conflict."""
+    service = _FakeService(_identity_responder(include_profile=False))
+    try:
+        with caplog.at_level(logging.INFO, logger=ws_receiver.__name__):
+            started = ws_receiver.start_ws_receiver(
+                host="127.0.0.1", port=service.port, path=WS_PATH
+            )
+    finally:
+        service.close()
+
+    assert started is None
+    assert "different or unidentified profile" in caplog.text
 
 
 @requires_aiohttp

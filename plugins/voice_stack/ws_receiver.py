@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import errno
+import hashlib
 import hmac
 import http.client
 import importlib
@@ -26,9 +27,10 @@ from collections.abc import Awaitable
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional
 
 try:
-    from aiohttp import WSMsgType, web
+    from aiohttp import WSCloseCode, WSMsgType, web
     AIOHTTP_AVAILABLE = True
 except ImportError:  # pragma: no cover - exercised only in minimal installs
+    WSCloseCode = None  # type: ignore[assignment]
     WSMsgType = None  # type: ignore[assignment]
     web = None  # type: ignore[assignment]
     AIOHTTP_AVAILABLE = False
@@ -106,6 +108,10 @@ def receiver_status(server: Optional["HermesHAWebSocketServer"] = None) -> dict[
     return {
         "ok": True,
         "service": "hermes-ha-ws",
+        # Stable across processes for the same profile, without exposing its
+        # filesystem path. The bind probe uses it to distinguish a harmless
+        # duplicate from another profile occupying this profile's endpoint.
+        "profile_id": _profile_identity(),
         "running": running,
         "uptime_seconds": round(time.monotonic() - _START_TIME, 1),
         "auth_required": bool(_configured_token()),
@@ -138,12 +144,28 @@ def _json_loads_maybe(value: Any) -> dict[str, Any]:
     return {"value": value}
 
 
+def _profile_env(name: str, default: Optional[str] = None) -> Optional[str]:
+    """Read one profile-scoped environment value, failing closed in multiplex.
+
+    Hermes keeps profile ``.env`` values in a ContextVar because ``os.environ``
+    belongs to the whole process. Import lazily so the receiver remains usable in
+    standalone tests; only an unavailable Hermes API permits the legacy fallback.
+    Exceptions from ``get_secret`` deliberately propagate rather than leaking a
+    launch profile's process environment into a routed profile.
+    """
+    try:
+        get_secret = getattr(importlib.import_module("agent.secret_scope"), "get_secret")
+    except (ImportError, AttributeError):
+        return os.environ.get(name, default)
+    return get_secret(name, default)
+
+
 def _configured_token() -> str:
     """Return the optional bearer token accepted by the HA WebSocket endpoint."""
     return (
-        os.getenv("HERMES_HA_WS_TOKEN")
-        or os.getenv("API_SERVER_KEY")
-        or os.getenv("HERMES_API_KEY")
+        _profile_env("HERMES_HA_WS_TOKEN")
+        or _profile_env("API_SERVER_KEY")
+        or _profile_env("HERMES_API_KEY")
         or ""
     ).strip()
 
@@ -339,6 +361,10 @@ class HermesHAWebSocketServer:
         self._active_connections = 0
         self._total_connections = 0
         self._connections_lock = threading.Lock()
+        # Accessed only by this server's event-loop thread. Explicitly closing
+        # every socket is required before AppRunner.cleanup(); otherwise aiohttp
+        # can wait indefinitely for Home Assistant's long-lived connection.
+        self._websockets: set["aiohttp_web.WebSocketResponse"] = set()
 
     @property
     def active_connections(self) -> int:
@@ -412,22 +438,8 @@ class HermesHAWebSocketServer:
             loop.run_forever()
         except Exception as exc:
             identity = _probe_receiver(self.host, self.port) if _is_port_conflict(exc) else None
-            if identity is not None and identity.get("path") == self.path:
-                logger.info(
-                    "Hermes HA WebSocket receiver already served on %s:%s%s by "
-                    "another Hermes receiver — not binding again",
-                    self.host,
-                    self.port,
-                    self.path,
-                )
-            elif identity is not None:
-                logger.warning(
-                    "Hermes HA WebSocket receiver: port %s is held by a Hermes "
-                    "receiver serving %s instead of %s — not binding again",
-                    self.port,
-                    identity.get("path"),
-                    self.path,
-                )
+            if identity is not None:
+                _log_existing_receiver(identity, self.host, self.port, self.path)
             else:
                 logger.warning("Hermes HA WebSocket receiver failed to start: %s", exc)
             self._started.set()
@@ -452,6 +464,17 @@ class HermesHAWebSocketServer:
 
     async def _shutdown(self) -> None:
         self._ready.clear()
+        sockets = tuple(self._websockets)
+        if sockets:
+            close_kwargs = (
+                {"code": WSCloseCode.GOING_AWAY, "message": b"receiver shutting down"}
+                if WSCloseCode is not None
+                else {}
+            )
+            await asyncio.gather(
+                *(ws.close(**close_kwargs) for ws in sockets),
+                return_exceptions=True,
+            )
         runner = self._runner
         self._runner = None
         if runner is not None:
@@ -471,6 +494,7 @@ class HermesHAWebSocketServer:
 
         ws = web.WebSocketResponse(heartbeat=30)
         await ws.prepare(request)
+        self._websockets.add(ws)
         self._connection_opened()
         await ws.send_json({"type": "hello", "ok": True, "service": "hermes-ha-ws"})
 
@@ -489,6 +513,7 @@ class HermesHAWebSocketServer:
                     logger.debug("HA WebSocket closed with error: %s", ws.exception())
                     break
         finally:
+            self._websockets.discard(ws)
             self._connection_closed()
         return ws
 
@@ -568,6 +593,12 @@ def _profile_scope() -> str:
     return os.path.realpath(os.path.expanduser(home)) if home else ""
 
 
+def _profile_identity() -> str:
+    """Opaque cross-process identity for the active Hermes profile."""
+    scope = _profile_scope()
+    return hashlib.sha256(scope.encode("utf-8")).hexdigest() if scope else ""
+
+
 def _module_owner() -> tuple[str, str]:
     """Stable owner boundary: source file plus active Hermes profile."""
     return (os.path.realpath(__file__), _profile_scope())
@@ -636,18 +667,67 @@ def _adoptable_receiver(
     return None, None
 
 
+def _log_existing_receiver(
+    identity: dict[str, Any], host: str, port: int, path: str
+) -> None:
+    """Classify a probed receiver as a duplicate or visible configuration conflict."""
+    served_path = identity.get("path")
+    served_profile = str(identity.get("profile_id") or "")
+    current_profile = _profile_identity()
+    same_profile = bool(
+        served_profile
+        and current_profile
+        and hmac.compare_digest(served_profile, current_profile)
+    )
+    if same_profile and served_path == path:
+        logger.info(
+            "Hermes HA WebSocket receiver already served on %s:%s%s by "
+            "another process for this profile — not binding again",
+            host,
+            port,
+            path,
+        )
+    elif not same_profile:
+        logger.warning(
+            "Hermes HA WebSocket receiver: port %s is held by a Hermes receiver "
+            "for a different or unidentified profile (serving %s); this profile's "
+            "receiver at %s will not start — configure a different HERMES_HA_WS_PORT",
+            port,
+            served_path,
+            path,
+        )
+    else:
+        logger.warning(
+            "Hermes HA WebSocket receiver: port %s is held by this profile's Hermes "
+            "receiver serving %s instead of %s — not binding again",
+            port,
+            served_path,
+            path,
+        )
+
+
 def start_ws_receiver(host: Optional[str] = None, port: Optional[int] = None, path: Optional[str] = None) -> Optional[HermesHAWebSocketServer]:
     """Start the singleton HA WebSocket receiver if enabled."""
-    if os.getenv("HERMES_HA_WS_ENABLED", "1").strip().lower() in {"0", "false", "no", "off"}:
+    enabled = str(_profile_env("HERMES_HA_WS_ENABLED", "1") or "").strip().lower()
+    if enabled in {"0", "false", "no", "off"}:
         logger.info("Hermes HA WebSocket receiver disabled by HERMES_HA_WS_ENABLED")
         return None
     if not AIOHTTP_AVAILABLE:
         logger.warning("Hermes HA WebSocket receiver unavailable: aiohttp is not installed")
         return None
 
-    resolved_host = host or os.getenv("HERMES_HA_WS_HOST", DEFAULT_WS_HOST)
-    resolved_port = int(port or os.getenv("HERMES_HA_WS_PORT", str(DEFAULT_WS_PORT)))
-    resolved_path = path or os.getenv("HERMES_HA_WS_PATH", DEFAULT_WS_PATH)
+    resolved_host = host if host is not None else str(
+        _profile_env("HERMES_HA_WS_HOST", DEFAULT_WS_HOST) or DEFAULT_WS_HOST
+    )
+    resolved_port_value: int | str = (
+        port
+        if port is not None
+        else (_profile_env("HERMES_HA_WS_PORT", str(DEFAULT_WS_PORT)) or str(DEFAULT_WS_PORT))
+    )
+    resolved_port = int(resolved_port_value)
+    resolved_path = path if path is not None else str(
+        _profile_env("HERMES_HA_WS_PATH", DEFAULT_WS_PATH) or DEFAULT_WS_PATH
+    )
 
     global _WS_SERVER
     with _WS_LOCK:
@@ -664,22 +744,9 @@ def start_ws_receiver(host: Optional[str] = None, port: Optional[int] = None, pa
 
         identity = _probe_receiver(resolved_host, resolved_port)
         if identity is not None:
-            if identity.get("path") == resolved_path:
-                logger.info(
-                    "Hermes HA WebSocket receiver already served on %s:%s%s by "
-                    "another Hermes receiver — not binding again",
-                    resolved_host,
-                    resolved_port,
-                    resolved_path,
-                )
-            else:
-                logger.warning(
-                    "Hermes HA WebSocket receiver: port %s is held by a Hermes "
-                    "receiver serving %s instead of %s — not binding again",
-                    resolved_port,
-                    identity.get("path"),
-                    resolved_path,
-                )
+            _log_existing_receiver(
+                identity, resolved_host, resolved_port, resolved_path
+            )
             return None
 
         _WS_SERVER = HermesHAWebSocketServer(resolved_host, resolved_port, resolved_path)
