@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import hmac
+import http.client
 import inspect
 import json
 import logging
@@ -38,13 +39,21 @@ logger = logging.getLogger(__name__)
 DEFAULT_WS_HOST = "0.0.0.0"
 DEFAULT_WS_PORT = 7860
 DEFAULT_WS_PATH = "/api/hermes/ws"
+DEFAULT_HEALTH_PATH = "/health"
+SERVICE_ID = "hermes-ha-ws"
 
 # The receiver is a process-wide singleton, but Hermes re-imports plugin modules
-# freely (a fresh import resets the module globals below), so the in-process
-# marker lives on `sys` — which survives re-imports — and the port itself is
-# probed before binding.
+# freely — the gateway, every CLI session and the dashboard each get fresh module
+# globals — so the live instance is recorded on `sys`, which survives re-imports,
+# and the port is probed before binding. The record carries its OWNER (the module
+# file it was loaded from, its bind config, the pid) so a receiver is only ever
+# reused by the module that started it: another profile's plugin loads a different
+# file and must not adopt it, and a reload whose file changed on disk is rebound
+# instead of silently served by the stale object.
 _PROC_SINGLETON_ATTR = "_hermes_voice_stack_ws_receiver"
 _BIND_PROBE_TIMEOUT = 1.5
+_PROBE_MAX_BYTES = 8192
+_WILDCARD_HOSTS = {"", "*", "0.0.0.0", "::"}
 
 _WS_SERVER: Optional["HermesHAWebSocketServer"] = None
 _WS_LOCK = threading.Lock()
@@ -391,11 +400,21 @@ class HermesHAWebSocketServer:
             logger.info("Hermes HA WebSocket receiver listening on %s:%s%s", self.host, self.port, self.path)
             loop.run_forever()
         except Exception as exc:
-            if _is_port_conflict(exc) and _probe_receiver(self.host, self.port, self.path):
+            identity = _probe_receiver(self.host, self.port) if _is_port_conflict(exc) else None
+            if identity is not None and identity.get("path") == self.path:
                 logger.info(
-                    "Hermes HA WebSocket receiver already served on %s:%s%s by another Hermes process — not binding again",
+                    "Hermes HA WebSocket receiver already served on %s:%s%s by "
+                    "another Hermes receiver — not binding again",
                     self.host,
                     self.port,
+                    self.path,
+                )
+            elif identity is not None:
+                logger.warning(
+                    "Hermes HA WebSocket receiver: port %s is held by a Hermes "
+                    "receiver serving %s instead of %s — not binding again",
+                    self.port,
+                    identity.get("path"),
                     self.path,
                 )
             else:
@@ -470,50 +489,130 @@ def _is_port_conflict(exc: BaseException) -> bool:
     return "address already in use" in str(exc).lower()
 
 
-def _probe_receiver(host: str, port: int, path: str, timeout: float = _BIND_PROBE_TIMEOUT) -> bool:
-    """True when something that answers like this receiver already listens there.
+def _probe_hosts(host: str) -> list[str]:
+    """Loopback addresses to probe for a receiver bound to ``host``.
 
-    Any Hermes process can load the plugin (gateway, CLI session, dashboard) and
-    each of them re-imports the module with fresh globals, so several processes
-    legitimately try the same port. A plain GET on the WebSocket path is answered
-    by this receiver — 401 when the bearer token is required, 400/426 when the
-    request is not a WebSocket upgrade — while a foreign service on that port
-    (e.g. the dashboard's 404) does not match, so a genuine conflict still warns.
+    A wildcard bind may be IPv4-only, IPv6-only or dual-stack depending on the
+    platform and the socket options, so both loopback addresses are tried; a
+    specific host is probed as given.
     """
-    probe_host = "127.0.0.1" if host in {"", "0.0.0.0", "::"} else host
-    request = (
-        f"GET {path} HTTP/1.1\r\n"
-        f"Host: {probe_host}:{port}\r\n"
-        "Connection: close\r\n\r\n"
-    ).encode("ascii", "ignore")
-    try:
-        with socket.create_connection((probe_host, port), timeout=timeout) as sock:
-            sock.settimeout(timeout)
-            sock.sendall(request)
-            status_line = sock.recv(64).split(b"\r\n", 1)[0]
-    except OSError:
-        return False
-    parts = status_line.split()
-    if len(parts) < 2 or not parts[0].startswith(b"HTTP/"):
-        return False
-    try:
-        code = int(parts[1])
-    except ValueError:
-        return False
-    return code in {400, 401, 426}
+    if host.strip() in _WILDCARD_HOSTS:
+        return ["127.0.0.1", "::1"]
+    return [host]
 
 
-def _process_receiver() -> Optional["HermesHAWebSocketServer"]:
-    """Return the receiver already started in THIS process (survives re-imports).
+def _health_identity(host: str, port: int, timeout: float) -> Optional[dict[str, Any]]:
+    """Return the parsed ``/health`` payload served on ``host:port``, or None.
 
-    Duck-typed on purpose: Hermes re-imports the module, so the instance found on
-    ``sys`` belongs to a *different* module object than this one and a class
-    identity check would reject a perfectly live receiver.
+    The receiver's health route is unauthenticated and states what it is, which
+    is the only trustworthy identity signal: an HTTP status is not identity (a
+    protected foreign API answers 401, an unrelated upgrade endpoint answers
+    426, generic validation answers 400), so the payload's service marker decides
+    whether the port belongs to a Hermes receiver.
     """
-    server = getattr(sys, _PROC_SINGLETON_ATTR, None)
-    if server is not None and getattr(server, "running", False):
-        return server
+    connection: Optional[http.client.HTTPConnection] = None
+    try:
+        connection = http.client.HTTPConnection(host, port, timeout=timeout)
+        connection.request("GET", DEFAULT_HEALTH_PATH, headers={"Connection": "close"})
+        response = connection.getresponse()
+        if response.status != 200:
+            return None
+        payload = json.loads(response.read(_PROBE_MAX_BYTES).decode("utf-8", "replace"))
+    except (OSError, ValueError, http.client.HTTPException):
+        return None
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except OSError:  # pragma: no cover - defensive
+                pass
+    return payload if isinstance(payload, dict) else None
+
+
+def _probe_receiver(host: str, port: int, timeout: float = _BIND_PROBE_TIMEOUT) -> Optional[dict[str, Any]]:
+    """Return the identity payload of the Hermes receiver serving ``host:port``.
+
+    Any Hermes process can load the plugin and several of them legitimately try
+    the same port, so the caller must not bind when this returns a payload — and
+    must still report a genuine conflict when it returns None.
+    """
+    for probe_host in _probe_hosts(host):
+        payload = _health_identity(probe_host, port, timeout)
+        if payload is not None and payload.get("service") == SERVICE_ID:
+            return payload
     return None
+
+
+def _module_fingerprint() -> tuple[str, float, int]:
+    """Identity of the code on disk behind this module (path, mtime, size)."""
+    path = os.path.abspath(__file__)
+    try:
+        stat = os.stat(path)
+    except OSError:  # pragma: no cover - file replaced mid-run
+        return (path, 0.0, 0)
+    return (path, stat.st_mtime, stat.st_size)
+
+
+def _owner_record() -> Optional[dict[str, Any]]:
+    """The receiver recorded on ``sys`` by whichever module started it."""
+    record = getattr(sys, _PROC_SINGLETON_ATTR, None)
+    return record if isinstance(record, dict) else None
+
+
+def _record_owner(server: "HermesHAWebSocketServer", config: tuple[str, int, str]) -> None:
+    setattr(
+        sys,
+        _PROC_SINGLETON_ATTR,
+        {
+            "server": server,
+            "fingerprint": _module_fingerprint(),
+            "config": config,
+            "pid": os.getpid(),
+        },
+    )
+
+
+def _adoptable_receiver(
+    resolved_host: str, resolved_port: int, resolved_path: str
+) -> tuple[Optional["HermesHAWebSocketServer"], Optional["HermesHAWebSocketServer"]]:
+    """Decide what to do with a receiver another module recorded on ``sys``.
+
+    Returns ``(reuse, stale)``: ``reuse`` is a live receiver this exact module
+    and config already own (same code on disk), and ``stale`` is one this module
+    owns but whose file changed since it started — the caller rebinds it so the
+    new code serves instead of the old object, which is still bound to the
+    previous module's handler.
+    """
+    record = _owner_record()
+    if record is None:
+        return None, None
+
+    server = record.get("server")
+    same_module = record.get("fingerprint", (None,))[0] == _module_fingerprint()[0]
+    same_config = record.get("config") == (resolved_host, resolved_port, resolved_path)
+    if record.get("pid") == os.getpid() and same_module and same_config:
+        if not getattr(server, "running", False):
+            return None, None
+        if record.get("fingerprint") == _module_fingerprint():
+            return server, None
+        logger.info(
+            "Hermes HA WebSocket receiver: %s changed on disk since the running "
+            "receiver started — rebinding it",
+            _module_fingerprint()[0],
+        )
+        return None, server
+
+    if server is not None:
+        logger.warning(
+            "Hermes HA WebSocket receiver: not reusing the receiver registered by "
+            "%s (pid %s, %s) — this module is %s with %s",
+            record.get("fingerprint", ("?",))[0],
+            record.get("pid"),
+            record.get("config"),
+            _module_fingerprint()[0],
+            (resolved_host, resolved_port, resolved_path),
+        )
+    return None, None
 
 
 def start_ws_receiver(host: Optional[str] = None, port: Optional[int] = None, path: Optional[str] = None) -> Optional[HermesHAWebSocketServer]:
@@ -533,22 +632,39 @@ def start_ws_receiver(host: Optional[str] = None, port: Optional[int] = None, pa
     with _WS_LOCK:
         if _WS_SERVER and _WS_SERVER.running:
             return _WS_SERVER
-        in_process = _process_receiver()
-        if in_process is not None:
-            _WS_SERVER = in_process
-            return in_process
-        if _probe_receiver(resolved_host, resolved_port, resolved_path):
-            logger.info(
-                "Hermes HA WebSocket receiver already served on %s:%s%s by another Hermes process — not binding again",
-                resolved_host,
-                resolved_port,
-                resolved_path,
-            )
+
+        reuse, stale = _adoptable_receiver(resolved_host, resolved_port, resolved_path)
+        if reuse is not None:
+            _WS_SERVER = reuse
+            return reuse
+        if stale is not None:
+            # Release the port so the reloaded code can take it over.
+            stale.stop()
+
+        identity = _probe_receiver(resolved_host, resolved_port)
+        if identity is not None:
+            if identity.get("path") == resolved_path:
+                logger.info(
+                    "Hermes HA WebSocket receiver already served on %s:%s%s by "
+                    "another Hermes receiver — not binding again",
+                    resolved_host,
+                    resolved_port,
+                    resolved_path,
+                )
+            else:
+                logger.warning(
+                    "Hermes HA WebSocket receiver: port %s is held by a Hermes "
+                    "receiver serving %s instead of %s — not binding again",
+                    resolved_port,
+                    identity.get("path"),
+                    resolved_path,
+                )
             return None
+
         _WS_SERVER = HermesHAWebSocketServer(resolved_host, resolved_port, resolved_path)
         _WS_SERVER.start()
         if _WS_SERVER.running:
-            setattr(sys, _PROC_SINGLETON_ATTR, _WS_SERVER)
+            _record_owner(_WS_SERVER, (resolved_host, resolved_port, resolved_path))
             return _WS_SERVER
         return None
 
@@ -559,7 +675,8 @@ def stop_ws_receiver() -> None:
     with _WS_LOCK:
         server = _WS_SERVER
         _WS_SERVER = None
-    if server is not None and getattr(sys, _PROC_SINGLETON_ATTR, None) is server:
+    record = _owner_record()
+    if server is not None and record is not None and record.get("server") is server:
         try:
             delattr(sys, _PROC_SINGLETON_ATTR)
         except AttributeError:  # pragma: no cover - defensive
