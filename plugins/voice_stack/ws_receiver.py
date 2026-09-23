@@ -9,9 +9,11 @@ control actions to the local voice stack tools.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import errno
 import hmac
 import http.client
+import importlib
 import inspect
 import json
 import logging
@@ -45,11 +47,11 @@ SERVICE_ID = "hermes-ha-ws"
 # The receiver is a process-wide singleton, but Hermes re-imports plugin modules
 # freely — the gateway, every CLI session and the dashboard each get fresh module
 # globals — so the live instance is recorded on `sys`, which survives re-imports,
-# and the port is probed before binding. The record carries its OWNER (the module
-# file it was loaded from, its bind config, the pid) so a receiver is only ever
-# reused by the module that started it: another profile's plugin loads a different
-# file and must not adopt it, and a reload whose file changed on disk is rebound
-# instead of silently served by the stale object.
+# and the port is probed before binding. The record carries its OWNER (module
+# file, Hermes profile, bind config and pid) so another profile cannot adopt or
+# stop it. A fresh import of the same owner rebinds even when the source bytes are
+# unchanged: Hermes force-reload creates a new PluginContext and assist handler,
+# while the old server remains bound to the old module's globals.
 _PROC_SINGLETON_ATTR = "_hermes_voice_stack_ws_receiver"
 _BIND_PROBE_TIMEOUT = 1.5
 _PROBE_MAX_BYTES = 8192
@@ -372,7 +374,16 @@ class HermesHAWebSocketServer:
         if self.running:
             return False
         self._stopped.clear()
-        self._thread = threading.Thread(target=self._run_thread, name="hermes-ha-ws", daemon=True)
+        # Plugin registration runs inside the owning profile's ContextVar scope.
+        # A bare thread would lose that scope and make Assist callbacks resolve
+        # the launch profile's model configuration and credentials instead.
+        thread_context = contextvars.copy_context()
+        self._thread = threading.Thread(
+            target=thread_context.run,
+            args=(self._run_thread,),
+            name="hermes-ha-ws",
+            daemon=True,
+        )
         self._thread.start()
         self._started.wait(timeout=5.0)
         return self.running
@@ -543,14 +554,23 @@ def _probe_receiver(host: str, port: int, timeout: float = _BIND_PROBE_TIMEOUT) 
     return None
 
 
-def _module_fingerprint() -> tuple[str, float, int]:
-    """Identity of the code on disk behind this module (path, mtime, size)."""
-    path = os.path.abspath(__file__)
+def _profile_scope() -> str:
+    """Return the active Hermes profile home without requiring Hermes in tests."""
     try:
-        stat = os.stat(path)
-    except OSError:  # pragma: no cover - file replaced mid-run
-        return (path, 0.0, 0)
-    return (path, stat.st_mtime, stat.st_size)
+        get_hermes_home = getattr(importlib.import_module("hermes_constants"), "get_hermes_home")
+    except (ImportError, AttributeError):
+        home = os.getenv("HERMES_HOME", "")
+    else:
+        try:
+            home = os.fspath(get_hermes_home())
+        except Exception:  # pragma: no cover - fail-soft outside Hermes runtime
+            home = os.getenv("HERMES_HOME", "")
+    return os.path.realpath(os.path.expanduser(home)) if home else ""
+
+
+def _module_owner() -> tuple[str, str]:
+    """Stable owner boundary: source file plus active Hermes profile."""
+    return (os.path.realpath(__file__), _profile_scope())
 
 
 def _owner_record() -> Optional[dict[str, Any]]:
@@ -565,7 +585,7 @@ def _record_owner(server: "HermesHAWebSocketServer", config: tuple[str, int, str
         _PROC_SINGLETON_ATTR,
         {
             "server": server,
-            "fingerprint": _module_fingerprint(),
+            "owner": _module_owner(),
             "config": config,
             "pid": os.getpid(),
         },
@@ -577,39 +597,40 @@ def _adoptable_receiver(
 ) -> tuple[Optional["HermesHAWebSocketServer"], Optional["HermesHAWebSocketServer"]]:
     """Decide what to do with a receiver another module recorded on ``sys``.
 
-    Returns ``(reuse, stale)``: ``reuse`` is a live receiver this exact module
-    and config already own (same code on disk), and ``stale`` is one this module
-    owns but whose file changed since it started — the caller rebinds it so the
-    new code serves instead of the old object, which is still bound to the
-    previous module's handler.
+    Returns ``(reuse, stale)``. Local ``_WS_SERVER`` handles reuse before this
+    function is called. Therefore a live same-owner record reached here belongs
+    to an earlier import and is always stale: even unchanged source was imported
+    with a new PluginContext and assist handler, while the old server still calls
+    functions in the previous module's globals.
     """
     record = _owner_record()
     if record is None:
         return None, None
 
     server = record.get("server")
-    same_module = record.get("fingerprint", (None,))[0] == _module_fingerprint()[0]
+    same_owner = record.get("owner") == _module_owner()
     same_config = record.get("config") == (resolved_host, resolved_port, resolved_path)
-    if record.get("pid") == os.getpid() and same_module and same_config:
+    if record.get("pid") == os.getpid() and same_owner and same_config:
         if not getattr(server, "running", False):
             return None, None
-        if record.get("fingerprint") == _module_fingerprint():
-            return server, None
         logger.info(
-            "Hermes HA WebSocket receiver: %s changed on disk since the running "
-            "receiver started — rebinding it",
-            _module_fingerprint()[0],
+            "Hermes HA WebSocket receiver: %s was reloaded for profile %s — "
+            "rebinding it to the new plugin context",
+            _module_owner()[0],
+            _module_owner()[1] or "<default>",
         )
         return None, server
 
     if server is not None:
         logger.warning(
             "Hermes HA WebSocket receiver: not reusing the receiver registered by "
-            "%s (pid %s, %s) — this module is %s with %s",
-            record.get("fingerprint", ("?",))[0],
+            "%s (profile %s, pid %s, %s) — this module is %s (profile %s) with %s",
+            record.get("owner", ("?", "?"))[0],
+            record.get("owner", ("?", "?"))[1] or "<default>",
             record.get("pid"),
             record.get("config"),
-            _module_fingerprint()[0],
+            _module_owner()[0],
+            _module_owner()[1] or "<default>",
             (resolved_host, resolved_port, resolved_path),
         )
     return None, None
@@ -671,10 +692,13 @@ def start_ws_receiver(host: Optional[str] = None, port: Optional[int] = None, pa
 
 def stop_ws_receiver() -> None:
     """Stop the singleton receiver."""
-    global _WS_SERVER
+    global _ASSIST_QUERY_HANDLER, _WS_SERVER
     with _WS_LOCK:
         server = _WS_SERVER
         _WS_SERVER = None
+        # Release the PluginContext captured by register(); a disabled or
+        # unloaded plugin must not leave stale model access reachable.
+        _ASSIST_QUERY_HANDLER = None
     record = _owner_record()
     if server is not None and record is not None and record.get("server") is server:
         try:

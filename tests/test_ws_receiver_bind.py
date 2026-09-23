@@ -14,16 +14,19 @@ answers 400.
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import logging
 import socket
 import sys
 import threading
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
 import pytest
+from aiohttp import ClientSession
 
 from plugins.voice_stack import ws_receiver
 
@@ -178,6 +181,22 @@ def _load_module(name: str, path: Path = MODULE_PATH):
     return module
 
 
+async def _assist_response_text(port: int, path: str) -> str:
+    """Send one real Assist query to the live receiver."""
+    async with ClientSession() as session:
+        async with session.ws_connect(f"http://127.0.0.1:{port}{path}") as ws:
+            await ws.receive_json()  # hello
+            await ws.send_json(
+                {
+                    "type": "assist_query",
+                    "text": "Which plugin context is live?",
+                    "conversation_id": "reload-test",
+                }
+            )
+            response = await ws.receive_json()
+            return str(response["text"])
+
+
 # --------------------------------------------------------------------------- #
 # Identity: the /health marker decides, not the HTTP status                    #
 # --------------------------------------------------------------------------- #
@@ -273,45 +292,37 @@ def test_running_requires_a_completed_bind() -> None:
 
 
 @requires_aiohttp
-def test_start_reuses_the_receiver_across_reimports(
-    free_port: int, caplog: pytest.LogCaptureFixture
-) -> None:
-    first_module = _load_module("ws_receiver_first")
-    first = first_module.start_ws_receiver(host="127.0.0.1", port=free_port, path=WS_PATH)
+def test_repeated_start_in_same_module_reuses_the_receiver(free_port: int) -> None:
+    module = _load_module("ws_receiver_repeated_start")
+    first = module.start_ws_receiver(host="127.0.0.1", port=free_port, path=WS_PATH)
     assert first is not None and first.running
     try:
-        second_module = _load_module("ws_receiver_second")
-        with caplog.at_level(logging.INFO, logger=second_module.__name__):
-            second = second_module.start_ws_receiver(
-                host="127.0.0.1", port=free_port, path=WS_PATH
-            )
-
+        second = module.start_ws_receiver(host="127.0.0.1", port=free_port, path=WS_PATH)
         assert second is first
-        assert "failed to start" not in caplog.text
     finally:
         first.stop()
 
 
 @requires_aiohttp
-def test_reload_with_changed_code_rebinds(
+def test_reload_rebinds_and_uses_the_new_assist_handler(
     free_port: int, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A reload whose file changed must serve the new code, not the old object.
+    """A reload must serve the new context even when source bytes are unchanged.
 
-    Otherwise the reloaded module keeps answering through a receiver still bound
-    to the previous module's globals and assist handler.
+    Hermes force-reload evicts and freshly imports the module after creating a
+    new PluginContext. Reusing the old receiver would leave its bound methods
+    resolving the previous module's assist handler.
     """
     first_module = _load_module("ws_receiver_stale_first")
+    first_module.set_assist_query_handler(lambda _payload: {"text": "old context"})
     first = first_module.start_ws_receiver(host="127.0.0.1", port=free_port, path=WS_PATH)
     assert first is not None and first.running
 
-    record = getattr(sys, first_module._PROC_SINGLETON_ATTR)
-    path, mtime, size = record["fingerprint"]
-    record["fingerprint"] = (path, mtime + 60, size)
     second = None
 
     try:
         second_module = _load_module("ws_receiver_stale_second")
+        second_module.set_assist_query_handler(lambda _payload: {"text": "new context"})
         with caplog.at_level(logging.INFO, logger=second_module.__name__):
             second = second_module.start_ws_receiver(
                 host="127.0.0.1", port=free_port, path=WS_PATH
@@ -321,6 +332,7 @@ def test_reload_with_changed_code_rebinds(
         assert second.running
         assert not first.running
         assert "rebinding" in caplog.text
+        assert asyncio.run(_assist_response_text(free_port, WS_PATH)) == "new context"
     finally:
         first.stop()
         if second is not None:
@@ -328,24 +340,51 @@ def test_reload_with_changed_code_rebinds(
 
 
 @requires_aiohttp
+def test_receiver_thread_preserves_the_owner_context(
+    free_port: int,
+) -> None:
+    """Assist callbacks must run in the profile scope that started the server."""
+    active_profile = ContextVar("test_receiver_profile", default="launch-profile")
+    token = active_profile.set("named-profile")
+    module = _load_module("ws_receiver_profile_context")
+    module.set_assist_query_handler(
+        lambda _payload: {"text": active_profile.get()}
+    )
+    server = module.start_ws_receiver(
+        host="127.0.0.1", port=free_port, path=WS_PATH
+    )
+    assert server is not None and server.running
+    active_profile.reset(token)
+
+    try:
+        assert active_profile.get() == "launch-profile"
+        assert asyncio.run(_assist_response_text(free_port, WS_PATH)) == "named-profile"
+    finally:
+        server.stop()
+
+
+@requires_aiohttp
 def test_another_profile_module_does_not_adopt_the_receiver(
-    tmp_path: Path, free_port: int, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    free_port: int,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A plugin loaded from another profile keeps its hands off.
 
     It must not reuse — or stop — a receiver another profile's module started.
     """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profiles" / "a"))
     first_module = _load_module("ws_receiver_profile_a")
     first = first_module.start_ws_receiver(host="127.0.0.1", port=free_port, path=WS_PATH)
     assert first is not None and first.running
 
-    other_dir = tmp_path / "profiles" / "other" / "plugins" / "voice_stack"
-    other_dir.mkdir(parents=True)
-    other_file = other_dir / "ws_receiver.py"
-    other_file.write_bytes(MODULE_PATH.read_bytes())
-
     try:
-        other_module = _load_module("ws_receiver_profile_b", other_file)
+        # Multiplex profiles can load the same project/bundled source path under
+        # different profile scopes. The profile home, not just __file__, must
+        # keep the second module from stopping or adopting the first receiver.
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profiles" / "b"))
+        other_module = _load_module("ws_receiver_profile_b")
         with caplog.at_level(logging.INFO, logger=other_module.__name__):
             adopted = other_module.start_ws_receiver(
                 host="127.0.0.1", port=free_port, path=WS_PATH
