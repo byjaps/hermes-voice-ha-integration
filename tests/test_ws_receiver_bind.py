@@ -445,6 +445,94 @@ def test_stop_closes_an_active_client_and_terminates_the_thread(
     assert server._thread is not None and not server._thread.is_alive()
 
 
+@requires_aiohttp
+def test_stop_cancels_an_in_flight_assist_request(
+    free_port: int,
+) -> None:
+    """A model request must not retain the old PluginContext after unload."""
+    module = _load_module("ws_receiver_in_flight_unload")
+    handler_started = threading.Event()
+    handler_cancelled = threading.Event()
+
+    async def blocked_handler(_payload: dict[str, Any]) -> dict[str, Any]:
+        handler_started.set()
+        try:
+            await asyncio.Event().wait()
+            raise AssertionError("blocked handler unexpectedly resumed")
+        finally:
+            handler_cancelled.set()
+
+    module.set_assist_query_handler(blocked_handler)
+    server = module.start_ws_receiver(
+        host="127.0.0.1", port=free_port, path=WS_PATH
+    )
+    assert server is not None and server.running
+
+    async def stop_during_request():
+        async with ClientSession() as session:
+            ws = await session.ws_connect(
+                f"http://127.0.0.1:{free_port}{WS_PATH}"
+            )
+            await ws.receive_json()
+            await ws.send_json(
+                {
+                    "type": "assist_query",
+                    "text": "wait forever",
+                    "conversation_id": "in-flight-stop",
+                }
+            )
+            assert await asyncio.to_thread(handler_started.wait, 2)
+            started = time.monotonic()
+            await asyncio.to_thread(module.stop_ws_receiver)
+            elapsed = time.monotonic() - started
+            close_message = await asyncio.wait_for(ws.receive(), timeout=2)
+            await ws.close()
+            return elapsed, close_message.type
+
+    elapsed, close_type = asyncio.run(stop_during_request())
+
+    assert elapsed < 2
+    assert handler_cancelled.wait(1)
+    assert close_type in {
+        ws_receiver.WSMsgType.CLOSE,
+        ws_receiver.WSMsgType.CLOSED,
+        ws_receiver.WSMsgType.CLOSING,
+    }
+    assert not server.running
+    assert server.active_connections == 0
+    assert server._thread is not None and not server._thread.is_alive()
+
+
+@requires_aiohttp
+def test_reset_during_hello_does_not_leak_connection_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A peer reset during the first write still runs connection cleanup."""
+
+    class ResetOnHelloWebSocket:
+        async def prepare(self, _request: Any) -> None:
+            return None
+
+        async def send_json(self, _payload: dict[str, Any]) -> None:
+            raise ConnectionResetError("peer reset before hello")
+
+    monkeypatch.setattr(
+        ws_receiver.web,
+        "WebSocketResponse",
+        lambda **_kwargs: ResetOnHelloWebSocket(),
+    )
+    server = ws_receiver.HermesHAWebSocketServer("127.0.0.1", 0, WS_PATH)
+    request: Any = types.SimpleNamespace(headers={})
+
+    with pytest.raises(ConnectionResetError, match="peer reset before hello"):
+        asyncio.run(server._handle_ws(request))
+
+    assert not server._websockets
+    assert not server._request_tasks
+    assert server.active_connections == 0
+    assert server.total_connections == 1
+
+
 # --------------------------------------------------------------------------- #
 # Owner boundaries: reuse, reload and other profiles                          #
 # --------------------------------------------------------------------------- #

@@ -45,6 +45,7 @@ DEFAULT_WS_PORT = 7860
 DEFAULT_WS_PATH = "/api/hermes/ws"
 DEFAULT_HEALTH_PATH = "/health"
 SERVICE_ID = "hermes-ha-ws"
+SHUTDOWN_TIMEOUT_SECONDS = 1.0
 
 # The receiver is a process-wide singleton, but Hermes re-imports plugin modules
 # freely — the gateway, every CLI session and the dashboard each get fresh module
@@ -365,6 +366,10 @@ class HermesHAWebSocketServer:
         # every socket is required before AppRunner.cleanup(); otherwise aiohttp
         # can wait indefinitely for Home Assistant's long-lived connection.
         self._websockets: set["aiohttp_web.WebSocketResponse"] = set()
+        # The aiohttp request task owns any in-flight Assist coroutine. Closing
+        # its socket alone does not cancel that coroutine, so unload must cancel
+        # and drain these tasks before AppRunner waits for request completion.
+        self._request_tasks: set[asyncio.Task[Any]] = set()
 
     @property
     def active_connections(self) -> int:
@@ -456,7 +461,7 @@ class HermesHAWebSocketServer:
         app = web.Application()
         app.router.add_get(self.path, self._handle_ws)
         app.router.add_get("/health", self._handle_health)
-        runner = web.AppRunner(app)
+        runner = web.AppRunner(app, shutdown_timeout=SHUTDOWN_TIMEOUT_SECONDS)
         await runner.setup()
         site = web.TCPSite(runner, self.host, self.port)
         await site.start()
@@ -465,20 +470,53 @@ class HermesHAWebSocketServer:
     async def _shutdown(self) -> None:
         self._ready.clear()
         sockets = tuple(self._websockets)
+        current_task = asyncio.current_task()
+        request_tasks = tuple(
+            task
+            for task in self._request_tasks
+            if task is not current_task and not task.done()
+        )
+        for task in request_tasks:
+            task.cancel()
+        if request_tasks:
+            _done, pending = await asyncio.wait(
+                request_tasks, timeout=SHUTDOWN_TIMEOUT_SECONDS
+            )
+            if pending:
+                logger.warning(
+                    "Hermes HA WebSocket receiver: %d request task(s) did not "
+                    "finish after cancellation",
+                    len(pending),
+                )
         if sockets:
             close_kwargs = (
                 {"code": WSCloseCode.GOING_AWAY, "message": b"receiver shutting down"}
                 if WSCloseCode is not None
                 else {}
             )
-            await asyncio.gather(
-                *(ws.close(**close_kwargs) for ws in sockets),
-                return_exceptions=True,
+            close_tasks = {
+                asyncio.create_task(ws.close(**close_kwargs)) for ws in sockets
+            }
+            _closed, close_pending = await asyncio.wait(
+                close_tasks, timeout=SHUTDOWN_TIMEOUT_SECONDS
             )
+            for task in close_pending:
+                task.cancel()
+            if close_pending:
+                logger.warning(
+                    "Hermes HA WebSocket receiver: force-closing %d unresponsive "
+                    "WebSocket(s)",
+                    len(close_pending),
+                )
+            await asyncio.gather(*close_tasks, return_exceptions=True)
         runner = self._runner
         self._runner = None
         if runner is not None:
             await runner.cleanup()
+        self._request_tasks.clear()
+        self._websockets.clear()
+        with self._connections_lock:
+            self._active_connections = 0
         if self._loop and self._loop.is_running():
             self._loop.call_soon_threadsafe(self._loop.stop)
 
@@ -494,11 +532,14 @@ class HermesHAWebSocketServer:
 
         ws = web.WebSocketResponse(heartbeat=30)
         await ws.prepare(request)
+        request_task = asyncio.current_task()
+        if request_task is not None:
+            self._request_tasks.add(request_task)
         self._websockets.add(ws)
         self._connection_opened()
-        await ws.send_json({"type": "hello", "ok": True, "service": "hermes-ha-ws"})
 
         try:
+            await ws.send_json({"type": "hello", "ok": True, "service": "hermes-ha-ws"})
             async for msg in ws:
                 if msg.type == WSMsgType.TEXT:
                     try:
@@ -513,6 +554,8 @@ class HermesHAWebSocketServer:
                     logger.debug("HA WebSocket closed with error: %s", ws.exception())
                     break
         finally:
+            if request_task is not None:
+                self._request_tasks.discard(request_task)
             self._websockets.discard(ws)
             self._connection_closed()
         return ws
