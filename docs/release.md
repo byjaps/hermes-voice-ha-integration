@@ -10,6 +10,18 @@ This repository ships three installation surfaces:
 
 The Python wheel is intentionally plugin-focused. The source distribution and GitHub tag contain the full bundle, including the Home Assistant custom component, add-on scaffold, docs, and skills.
 
+## v0.0.17 release notes (2026-10-25)
+
+- Restore the listener owner's Hermes home and profile-secret scope for each health and WebSocket request, including awaited Assist callbacks ([#53](https://github.com/rusty4444/hermes-voice-ha-integration/pull/53)). The registration-time fix in v0.0.16 was insufficient for the multiplexed gateway reported in [#49](https://github.com/rusty4444/hermes-voice-ha-integration/issues/49).
+- Retry failed initial Home Assistant WebSocket connections when the Hermes gateway becomes available ([#52](https://github.com/rusty4444/hermes-voice-ha-integration/pull/52)).
+- Keep the Python package, HACS integration, add-on scaffold and both Hermes plugin manifests aligned at 0.0.17.
+
+### Upgrade and reporter confirmation
+
+Update the HA integration through HACS or manual copy, reinstall the Hermes-side plugins using the v0.0.17 pip command in the README, and restart both Home Assistant and Hermes. Updating HACS alone does not replace the Hermes-side plugins.
+
+Keep #49 open until the reporter confirms authentication, Assist replies and reconnection after a gateway restart on Hermes 0.22.2/Python 3.14. Local automated tests use mocked HA objects and loopback WebSocket clients; they do not establish live Home Assistant or end-to-end voice compatibility. Edge TTS requires an external service, and the add-on remains an early scaffold.
+
 ## Maintainer checklist
 
 1. Update code and tests on a feature branch.
@@ -41,7 +53,7 @@ The Python wheel is intentionally plugin-focused. The source distribution and Gi
    git push origin vX.Y.Z
    ```
 
-7. Create a GitHub release with the built artifacts and release notes.
+7. Wait for tag CI to pass, download its `release-dist` artifact, and create a GitHub release with the wheel, source distribution and release notes. Tag pushes do not create a GitHub release: the repository has no automated release-publishing workflow.
 8. Verify the release:
 
    ```bash
@@ -58,3 +70,5 @@ The CI workflow runs on pull requests, `main`, and version tags. It verifies:
 - wheel/source distribution build
 - metadata/version integrity
 - tag/version match for `v*` tags
+
+The workflow tests Python 3.11 and 3.12. On a `v*` tag, only the Python 3.12 job uploads `dist/*` as the `release-dist` Actions artifact. CI has read-only repository contents permissions and does not publish a GitHub release or upload assets to one. The maintainer must publish the release and attach the artifacts after verifying tag CI.
