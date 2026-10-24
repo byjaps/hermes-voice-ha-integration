@@ -27,7 +27,7 @@ This repository is a bundle of three pieces:
 
 The Python wheel is intentionally plugin-focused. Use the GitHub tag or source distribution for the full HACS/custom-component/add-on bundle.
 
-> **Next release (not yet published):** `v0.0.17` restores the owning profile's home and secret scope for each HA receiver request and retries failed initial WebSocket connections. The latest published release remains `v0.0.16`; its registration-time scope fix alone does not resolve every case in [#49](https://github.com/rusty4444/hermes-voice-ha-integration/issues/49). The fixes are already on `main`, but upgrading to the existing `v0.0.16` tag will not install them.
+> **v0.0.17 (2026-10-25):** restores the owning profile's home and secret scope for each HA receiver request and retries failed initial WebSocket connections. The registration-time scope fix in `v0.0.16` was insufficient for the multiplexed gateway in [#49](https://github.com/rusty4444/hermes-voice-ha-integration/issues/49). Update both the HA integration and Hermes-side plugins, then restart Home Assistant and Hermes. Keep #49 open pending reporter confirmation on Hermes 0.22.2/Python 3.14, including authentication, Assist replies and reconnection after a gateway restart. Local automated checks do not establish live Home Assistant or end-to-end voice compatibility.
 
 ---
 
@@ -162,7 +162,7 @@ Keep this token private. It can control your Home Assistant instance with your a
 Install or upgrade the package directly from GitHub, then run the bundled plugin installer:
 
 ```bash
-python3 -m pip install --upgrade "hermes-voice-ha-integration @ git+https://github.com/rusty4444/hermes-voice-ha-integration.git@v0.0.16"
+python3 -m pip install --upgrade "hermes-voice-ha-integration @ git+https://github.com/rusty4444/hermes-voice-ha-integration.git@v0.0.17"
 hermes-ha-install-plugins
 ```
 
