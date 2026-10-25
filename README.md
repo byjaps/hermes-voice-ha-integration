@@ -27,7 +27,7 @@ This repository is a bundle of three pieces:
 
 The Python wheel is intentionally plugin-focused. Use the GitHub tag or source distribution for the full HACS/custom-component/add-on bundle.
 
-> **v0.0.17 (2026-10-25):** restores the owning profile's home and secret scope for each HA receiver request and retries failed initial WebSocket connections. The registration-time scope fix in `v0.0.16` was insufficient for the multiplexed gateway in [#49](https://github.com/rusty4444/hermes-voice-ha-integration/issues/49). Update both the HA integration and Hermes-side plugins, then restart Home Assistant and Hermes. Keep #49 open pending reporter confirmation on Hermes 0.22.2/Python 3.14, including authentication, Assist replies and reconnection after a gateway restart. Local automated checks do not establish live Home Assistant or end-to-end voice compatibility.
+> **v0.0.17 (2026-10-25):** restores the owning profile's home and secret scope for each HA receiver request and retries failed initial WebSocket connections. The registration-time scope fix in `v0.0.16` was insufficient for the multiplexed setup in [#49](https://github.com/rusty4444/hermes-voice-ha-integration/issues/49). After updating both components and removing the workaround, [the reporter confirmed](https://github.com/rusty4444/hermes-voice-ha-integration/issues/49#issuecomment-6390381851) `/health` returning 200 with `auth_required: true`, Assist replies through `conversation.process` and Voice PE, and automatic reconnection on Hermes 0.22.2/Python 3.14 with `multiplex_profiles: true`. Update both the HA integration and Hermes-side plugins, then restart Home Assistant and the Hermes process that owns the receiver port; on the reported installation that was `hermes dashboard`, not the gateway. This is confirmation of that setup, not a guarantee for every Home Assistant or voice deployment.
 
 ---
 
@@ -230,7 +230,7 @@ plugins:
 
 If your config already has a `plugins.enabled` list, add the two entries instead of replacing the whole section.
 
-Restart Hermes after changing plugins or `.env`.
+Restart the Hermes process that actually owns the configured receiver port after changing plugins or `.env`. The owner can be the gateway, a dashboard or a CLI session; restarting a different Hermes process does not replace the listener. In [the #49 reporter's setup](https://github.com/rusty4444/hermes-voice-ha-integration/issues/49#issuecomment-6390381851), `hermes dashboard` held port 7860, so `hermes gateway restart` alone was not the required restart. Use that process's normal service or launch procedure, and restart Home Assistant after updating its integration.
 
 **How the WebSocket receiver starts:** The WebSocket receiver does not require a standalone `server.py` file. It starts automatically when the `voice_stack` plugin loads. After restarting Hermes, check that the WebSocket is active:
 

@@ -4,6 +4,9 @@ All notable changes to the hermes-voice-ha-integration project.
 
 ## [Unreleased]
 
+### Documentation
+- Record @hanleymk's v0.0.17 confirmation for multiplexed Hermes 0.22.2/Python 3.14 and clarify that upgrades must restart the process owning the receiver port, which can be a dashboard rather than the gateway.
+
 ## [0.0.17] - 2026-10-25
 
 ### Fixed
@@ -15,7 +18,7 @@ All notable changes to the hermes-voice-ha-integration project.
 
 ### Validation and limitations
 - Local automated tests use mocked Home Assistant objects and loopback WebSocket clients; they do not establish live Home Assistant or end-to-end voice compatibility.
-- Reporter-environment confirmation on Hermes 0.22.2/Python 3.14 remains pending. Keep [#49](https://github.com/rusty4444/hermes-voice-ha-integration/issues/49) open until the reporter updates both the HA integration and Hermes-side plugins, restarts both services, and confirms authentication, Assist replies and reconnection after a gateway restart.
+- At publication, reporter-environment confirmation was pending. [The subsequent v0.0.17 report](https://github.com/rusty4444/hermes-voice-ha-integration/issues/49#issuecomment-6390381851) confirms health/auth status, Assist replies and automatic reconnection on Hermes 0.22.2/Python 3.14 with multiplexing enabled. The receiver was owned by `hermes dashboard` on that installation, so the reporter restarted that process rather than the gateway. This is evidence for the reported setup, not every deployment.
 
 ## [0.0.16] — 2026-10-19
 
