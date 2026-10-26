@@ -176,10 +176,6 @@ def _install_homeassistant_stubs() -> bool:
         def get() -> None:
             return None
 
-    def async_get_agent(hass: Any, agent_id: str) -> Any:
-        """Expose the fake native agent for recognition-only checks."""
-        return _LOCAL_AGENT["agent"]
-
     async def async_handle_intents(
         hass: Any,
         user_input: ConversationInput,
@@ -201,7 +197,6 @@ def _install_homeassistant_stubs() -> bool:
     conv.ConversationResult = ConversationResult
     conv.ConversationEntity = ConversationEntity
     setattr(conv, "async_handle_intents", async_handle_intents)
-    setattr(conv, "async_get_agent", async_get_agent)
     setattr(sys.modules["homeassistant.components"], "conversation", conv)
     chat_log_mod = sys.modules["homeassistant.components.conversation.chat_log"]
     setattr(chat_log_mod, "ChatLog", ChatLog)
@@ -693,8 +688,8 @@ async def test_bracketed_noise_does_not_hijack_a_house_command() -> None:
 
 
 @needs_stubs
-async def test_two_recognised_parts_are_both_resolved_locally() -> None:
-    """A multi-clause order only stays local when every part is recognised."""
+async def test_two_commands_in_one_phrase_never_run_half_locally() -> None:
+    """A multi-clause order always goes to Hermes: running half is worse."""
     text = "desligar a luz pequena. ligar a luz grande."
     agent, bridge = _make_agent(LOCAL_INTENTS_COMMANDS)
     local = _use_local_agent(
@@ -706,5 +701,49 @@ async def test_two_recognised_parts_are_both_resolved_locally() -> None:
 
     await agent.async_process(_input(text))
 
-    assert local.executions == ["desligar a luz pequena", "ligar a luz grande"]
-    assert bridge.texts == []
+    assert local.executions == []
+    assert bridge.texts == [text]
+
+
+@needs_stubs
+async def test_short_cancellation_clause_is_never_dropped() -> None:
+    """A one-word cancellation between commands must block local execution."""
+    text = "ligar a luz pequena. cancela. ligar a luz grande."
+    agent, bridge = _make_agent(LOCAL_INTENTS_COMMANDS)
+    local = _use_local_agent(
+        {
+            "ligar a luz pequena": (ACTION, "Ligado"),
+            "ligar a luz grande": (ACTION, "Ligado"),
+        }
+    )
+
+    await agent.async_process(_input(text))
+
+    assert local.executions == []
+    assert bridge.texts == [text]
+
+
+@needs_stubs
+async def test_parenthesised_cancellation_is_not_stripped() -> None:
+    """Real speech inside parentheses is never discarded as an annotation."""
+    text = "desligar a luz pequena (afinal, não desligues)"
+    agent, bridge = _make_agent(LOCAL_INTENTS_COMMANDS)
+    local = _use_local_agent({"desligar a luz pequena": (ACTION, "Desligado")})
+
+    await agent.async_process(_input(text))
+
+    assert local.executions == []
+    assert bridge.texts == [text]
+
+
+@needs_stubs
+async def test_unknown_bracketed_text_is_not_stripped() -> None:
+    """Only known non-speech markers are removed, recognised or not."""
+    text = "ligar a luz pequena [NÃO DESLIGUES]"
+    agent, bridge = _make_agent(LOCAL_INTENTS_COMMANDS)
+    local = _use_local_agent({"ligar a luz pequena": (ACTION, "Ligado")})
+
+    await agent.async_process(_input(text))
+
+    assert local.executions == []
+    assert bridge.texts == [text]
